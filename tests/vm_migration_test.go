@@ -43,9 +43,9 @@ var _ = Describe("VmMigration", func() {
 	virtClient, err := kubecli.GetKubevirtClient()
 	tests.PanicOnError(err)
 
-	var sourceVM *v1.VM
+	var sourceVM *v1.VirtualMachine
 
-	var TIMEOUT float64 = 10.0
+	var TIMEOUT float64 = 60.0
 	var POLLING_INTERVAL float64 = 0.1
 
 	BeforeEach(func() {
@@ -72,7 +72,7 @@ var _ = Describe("VmMigration", func() {
 		})
 
 		It("Should go to MigrationRunning state if the VM exists", func(done Done) {
-			vm, err := virtClient.RestClient().Post().Resource("vms").Namespace(tests.NamespaceTestDefault).Body(sourceVM).Do().Get()
+			vm, err := virtClient.RestClient().Post().Resource("virtualmachines").Namespace(tests.NamespaceTestDefault).Body(sourceVM).Do().Get()
 			Expect(err).ToNot(HaveOccurred())
 			tests.WaitForSuccessfulVMStart(vm)
 
@@ -89,21 +89,67 @@ var _ = Describe("VmMigration", func() {
 			close(done)
 		}, 30)
 
+		It("Should respect and preserve pre-set node affinity on the VM", func(done Done) {
+			// Prepare dummy affinity rule
+			sourceVM.Spec.Affinity = &v1.Affinity{
+				NodeAffinity: &k8sv1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &k8sv1.NodeSelector{
+						NodeSelectorTerms: []k8sv1.NodeSelectorTerm{
+							{
+								MatchExpressions: []k8sv1.NodeSelectorRequirement{
+									{
+										Key:      "invalidtag",
+										Values:   []string{"nothing"},
+										Operator: k8sv1.NodeSelectorOpNotIn,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			vm, err := virtClient.RestClient().Post().Resource("virtualmachines").Namespace(tests.NamespaceTestDefault).Body(sourceVM).Do().Get()
+			Expect(err).ToNot(HaveOccurred())
+			tests.WaitForSuccessfulVMStart(vm)
+
+			migration := tests.NewRandomMigrationForVm(sourceVM)
+			err = virtClient.RestClient().Post().Resource("migrations").Namespace(tests.NamespaceTestDefault).Body(migration).Do().Error()
+			Expect(err).ToNot(HaveOccurred())
+
+			Eventually(func() v1.MigrationPhase {
+				obj, err := virtClient.RestClient().Get().Resource("migrations").Namespace(tests.NamespaceTestDefault).Name(migration.ObjectMeta.Name).Do().Get()
+				Expect(err).ToNot(HaveOccurred())
+				var m *v1.Migration = obj.(*v1.Migration)
+				return m.Status.Phase
+			}, 3*TIMEOUT, POLLING_INTERVAL).Should(Equal(v1.MigrationSucceeded))
+
+			// Check Pod and VM affinity
+			labelSelector, err := labels.Parse(v1.DomainLabel + "=" + sourceVM.ObjectMeta.Name + "," + v1.MigrationLabel + "=" + migration.ObjectMeta.Name)
+			Expect(err).ToNot(HaveOccurred())
+
+			pods, err := virtClient.CoreV1().Pods(tests.NamespaceTestDefault).List(metav1.ListOptions{LabelSelector: labelSelector.String()})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pods.Items[0].Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0]).To(BeEquivalentTo(sourceVM.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0]))
+
+			close(done)
+		}, 90)
+
 		Context("New Migration given", func() {
 			table.DescribeTable("Should migrate the VM", func(namespace string, migrateCount int) {
 
 				// Create the VM
 				sourceVM = tests.NewRandomVMWithNS(namespace)
-				obj, err := virtClient.RestClient().Post().Resource("vms").Namespace(namespace).Body(sourceVM).Do().Get()
+				obj, err := virtClient.RestClient().Post().Resource("virtualmachines").Namespace(namespace).Body(sourceVM).Do().Get()
 				Expect(err).ToNot(HaveOccurred())
 				tests.WaitForSuccessfulVMStart(obj)
 
 				for x := 0; x < migrateCount; x++ {
-					vmMeta := obj.(*v1.VM).ObjectMeta
-					obj, err = virtClient.RestClient().Get().Resource("vms").Namespace(vmMeta.Namespace).Name(vmMeta.Name).Do().Get()
+					vmMeta := obj.(*v1.VirtualMachine).ObjectMeta
+					obj, err = virtClient.RestClient().Get().Resource("virtualmachines").Namespace(vmMeta.Namespace).Name(vmMeta.Name).Do().Get()
 					Expect(err).ToNot(HaveOccurred())
 
-					sourceNode := obj.(*v1.VM).Status.NodeName
+					sourceNode := obj.(*v1.VirtualMachine).Status.NodeName
 
 					// Create the Migration
 					migration := tests.NewRandomMigrationForVm(sourceVM)
@@ -130,15 +176,15 @@ var _ = Describe("VmMigration", func() {
 
 					// Give the pod controller some time to update the VM after successful migrations
 					Eventually(func() v1.VMPhase {
-						obj, err := virtClient.RestClient().Get().Resource("vms").Namespace(obj.(*v1.VM).ObjectMeta.Namespace).Name(obj.(*v1.VM).ObjectMeta.Name).Do().Get()
+						obj, err := virtClient.RestClient().Get().Resource("virtualmachines").Namespace(obj.(*v1.VirtualMachine).ObjectMeta.Namespace).Name(obj.(*v1.VirtualMachine).ObjectMeta.Name).Do().Get()
 						Expect(err).ToNot(HaveOccurred())
-						fetchedVM := obj.(*v1.VM)
+						fetchedVM := obj.(*v1.VirtualMachine)
 						return fetchedVM.Status.Phase
 					}, TIMEOUT, POLLING_INTERVAL).Should(Equal(v1.Running))
 
-					obj, err = virtClient.RestClient().Get().Resource("vms").Namespace(obj.(*v1.VM).ObjectMeta.Namespace).Name(obj.(*v1.VM).ObjectMeta.Name).Do().Get()
+					obj, err = virtClient.RestClient().Get().Resource("virtualmachines").Namespace(obj.(*v1.VirtualMachine).ObjectMeta.Namespace).Name(obj.(*v1.VirtualMachine).ObjectMeta.Name).Do().Get()
 					Expect(err).ToNot(HaveOccurred())
-					migratedVM := obj.(*v1.VM)
+					migratedVM := obj.(*v1.VirtualMachine)
 					Expect(migratedVM.Status.Phase).To(Equal(v1.Running))
 					Expect(migratedVM.Status.NodeName).ToNot(Equal(sourceNode))
 				}
@@ -150,7 +196,7 @@ var _ = Describe("VmMigration", func() {
 
 		It("Should create a pod to execute VM migration", func(done Done) {
 			// Create the VM
-			vm, err := virtClient.RestClient().Post().Resource("vms").Namespace(tests.NamespaceTestDefault).Body(sourceVM).Do().Get()
+			vm, err := virtClient.RestClient().Post().Resource("virtualmachines").Namespace(tests.NamespaceTestDefault).Body(sourceVM).Do().Get()
 			Expect(err).ToNot(HaveOccurred())
 			tests.WaitForSuccessfulVMStart(vm)
 

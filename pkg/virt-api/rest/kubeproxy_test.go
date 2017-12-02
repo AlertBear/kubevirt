@@ -44,13 +44,13 @@ import (
 
 	"kubevirt.io/kubevirt/pkg/api/v1"
 	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/log"
 	rest2 "kubevirt.io/kubevirt/pkg/rest"
 	. "kubevirt.io/kubevirt/pkg/testutils"
 	. "kubevirt.io/kubevirt/pkg/virt-api/rest"
 )
 
-const vmResource = "vms"
+const vmResource = "virtualmachines"
 const migrationResource = "migrations"
 const vmName = "test-vm"
 
@@ -62,7 +62,7 @@ var _ = Describe("Kubeproxy", func() {
 	migrationGVR := schema.GroupVersionResource{Group: v1.GroupVersion.Group, Version: v1.GroupVersion.Version, Resource: migrationResource}
 	ctx := context.Background()
 	var restClient *rest.RESTClient
-	var sourceVM *v1.VM
+	var sourceVM *v1.VirtualMachine
 	var sourceMigration *v1.Migration
 
 	// Work around go-client bug
@@ -74,7 +74,7 @@ var _ = Describe("Kubeproxy", func() {
 	expectedMigration.TypeMeta.Kind = ""
 	expectedMigration.TypeMeta.APIVersion = ""
 
-	logging.DefaultLogger().SetIOWriter(GinkgoWriter)
+	log.Log.SetIOWriter(GinkgoWriter)
 
 	BeforeSuite(func() {
 		apiserverMock = ghttp.NewServer()
@@ -82,7 +82,7 @@ var _ = Describe("Kubeproxy", func() {
 
 		ws, err := GroupVersionProxyBase(ctx, v1.GroupVersion)
 		Expect(err).ToNot(HaveOccurred())
-		ws, err = GenericResourceProxy(ws, ctx, vmGVR, &v1.VM{}, v1.VMGroupVersionKind.Kind, &v1.VMList{})
+		ws, err = GenericResourceProxy(ws, ctx, vmGVR, &v1.VirtualMachine{}, v1.VirtualMachineGroupVersionKind.Kind, &v1.VirtualMachineList{})
 		Expect(err).ToNot(HaveOccurred())
 		ws, err = GenericResourceProxy(ws, ctx, migrationGVR, &v1.Migration{}, "Migration", &v1.MigrationList{})
 		Expect(err).ToNot(HaveOccurred())
@@ -114,7 +114,7 @@ var _ = Describe("Kubeproxy", func() {
 			result := restClient.Get().AbsPath("/apis/kubevirt.io/v1alpha1/").Do()
 			Expect(result).To(HaveStatusCode(http.StatusOK))
 			body, _ := result.Raw()
-			var obj v1.VM
+			var obj v1.VirtualMachine
 			Expect(json.Unmarshal(body, &obj)).To(Succeed())
 			Expect(&obj).To(Equal(expectedVM))
 		})
@@ -134,7 +134,7 @@ var _ = Describe("Kubeproxy", func() {
 		})
 		It("Get with invalid VM name should fail with 400", func() {
 			result := restClient.Get().Resource(vmResource).Namespace(k8sv1.NamespaceDefault).Name("UPerLetterIsInvalid").Do()
-			Expect(result).To(HaveStatusCode(http.StatusNotFound))
+			Expect(result).To(HaveStatusCode(http.StatusBadRequest))
 		})
 		table.DescribeTable("PUT should succeed", func(contentType string, accept string) {
 			apiserverMock.AppendHandlers(
@@ -166,6 +166,22 @@ var _ = Describe("Kubeproxy", func() {
 			result := restClient.Delete().Resource(vmResource).Name(sourceVM.GetObjectMeta().GetName()).Namespace(k8sv1.NamespaceDefault).Do()
 			Expect(result).To(HaveStatusCode(http.StatusOK))
 		})
+		It("DELETE with delete options should succeed", func() {
+			policy := v12.DeletePropagationOrphan
+			apiserverMock.AppendHandlers(
+				ghttp.CombineHandlers(
+					ghttp.VerifyRequest(http.MethodDelete, vmPath(sourceVM)),
+					ghttp.RespondWithJSONEncoded(http.StatusOK, struct{}{}),
+					ghttp.VerifyJSONRepresenting(&v12.DeleteOptions{
+						TypeMeta: v12.TypeMeta{
+							Kind:       "DeleteOptions",
+							APIVersion: "kubevirt.io/v1alpha1"},
+						PropagationPolicy: &policy}),
+				),
+			)
+			result := restClient.Delete().Resource(vmResource).Name(sourceVM.GetObjectMeta().GetName()).Namespace(k8sv1.NamespaceDefault).Body(&v12.DeleteOptions{PropagationPolicy: &policy}).Do()
+			Expect(result).To(HaveStatusCode(http.StatusOK))
+		})
 		table.DescribeTable("GET a VM should succeed", func(accept string) {
 			apiserverMock.AppendHandlers(
 				ghttp.CombineHandlers(
@@ -181,16 +197,16 @@ var _ = Describe("Kubeproxy", func() {
 			table.Entry("receiving JSON", rest2.MIME_JSON),
 			table.Entry("receiving YAML", rest2.MIME_YAML),
 		)
-		It("GET a VMList should succeed", func() {
+		It("GET a VirtualMachineList should succeed", func() {
 			apiserverMock.AppendHandlers(
 				ghttp.CombineHandlers(
 					ghttp.VerifyRequest(http.MethodGet, vmBasePath()),
-					ghttp.RespondWithJSONEncoded(http.StatusOK, v1.VMList{TypeMeta: v12.TypeMeta{APIVersion: v1.GroupVersion.String(), Kind: "VMList"}, Items: []v1.VM{*expectedVM}}),
+					ghttp.RespondWithJSONEncoded(http.StatusOK, v1.VirtualMachineList{TypeMeta: v12.TypeMeta{APIVersion: v1.GroupVersion.String(), Kind: "VirtualMachineList"}, Items: []v1.VirtualMachine{*expectedVM}}),
 				),
 			)
 			result := restClient.Get().Resource(vmResource).Namespace(k8sv1.NamespaceDefault).Do()
 			Expect(result).To(HaveStatusCode(http.StatusOK))
-			Expect(result).To(HaveBodyEqualTo(&v1.VMList{Items: []v1.VM{*expectedVM}}))
+			Expect(result).To(HaveBodyEqualTo(&v1.VirtualMachineList{Items: []v1.VirtualMachine{*expectedVM}}))
 		})
 		It("Merge Patch should succeed", func() {
 			apiserverMock.AppendHandlers(
@@ -208,7 +224,7 @@ var _ = Describe("Kubeproxy", func() {
 			).Do().Get()
 			Expect(err).ToNot(HaveOccurred())
 			Expect(obj).ToNot(Equal(expectedVM))
-			Expect(obj.(*v1.VM).Spec.NodeSelector).Should(HaveKeyWithValue("test/lala", "blub"))
+			Expect(obj.(*v1.VirtualMachine).Spec.NodeSelector).Should(HaveKeyWithValue("test/lala", "blub"))
 		})
 		It("JSON Patch should succeed", func() {
 			apiserverMock.AppendHandlers(
@@ -226,7 +242,7 @@ var _ = Describe("Kubeproxy", func() {
 			).Do().Get()
 			Expect(err).ToNot(HaveOccurred())
 			Expect(obj).ToNot(Equal(expectedVM))
-			Expect(obj.(*v1.VM).Spec.NodeSelector).Should(HaveKeyWithValue("test/lala", "blub"))
+			Expect(obj.(*v1.VirtualMachine).Spec.NodeSelector).Should(HaveKeyWithValue("test/lala", "blub"))
 		})
 		It("JSON Patch should fail on invalid update", func() {
 			apiserverMock.AppendHandlers(
@@ -305,16 +321,16 @@ var _ = Describe("Kubeproxy", func() {
 			result := restClient.Get().Resource(vmResource).Name(sourceVM.GetObjectMeta().GetName()).Namespace(k8sv1.NamespaceDefault).Do()
 			Expect(result).To(HaveStatusCode(http.StatusNotFound))
 		})
-		It("GET a VMList should return an empty list", func() {
+		It("GET a VirtualMachineList should return an empty list", func() {
 			apiserverMock.AppendHandlers(
 				ghttp.CombineHandlers(
 					ghttp.VerifyRequest(http.MethodGet, vmBasePath()),
-					ghttp.RespondWithJSONEncoded(http.StatusOK, v1.VMList{TypeMeta: v12.TypeMeta{APIVersion: v1.GroupVersion.String(), Kind: "VMList"}}),
+					ghttp.RespondWithJSONEncoded(http.StatusOK, v1.VirtualMachineList{TypeMeta: v12.TypeMeta{APIVersion: v1.GroupVersion.String(), Kind: "VirtualMachineList"}}),
 				),
 			)
 			obj, err := restClient.Get().Resource(vmResource).Namespace(k8sv1.NamespaceDefault).Do().Get()
 			Expect(err).ToNot(HaveOccurred())
-			Expect(obj).To(Equal(&v1.VMList{}))
+			Expect(obj).To(Equal(&v1.VirtualMachineList{}))
 		})
 		It("Merge Patch should fail with 404", func() {
 			apiserverMock.AppendHandlers(
@@ -401,14 +417,14 @@ var _ = Describe("Kubeproxy", func() {
 })
 
 func vmBasePath() string {
-	return "/apis/kubevirt.io/v1alpha1/namespaces/default/vms"
+	return "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines"
 }
 
 func migrationBasePath() string {
 	return "/apis/kubevirt.io/v1alpha1/namespaces/default/migrations"
 }
 
-func vmPath(vm *v1.VM) string {
+func vmPath(vm *v1.VirtualMachine) string {
 	return vmBasePath() + "/" + vm.GetObjectMeta().GetName()
 }
 

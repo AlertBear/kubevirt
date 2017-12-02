@@ -28,6 +28,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"kubevirt.io/kubevirt/pkg/api/v1"
 	"kubevirt.io/kubevirt/pkg/kubecli"
 	"kubevirt.io/kubevirt/pkg/virt-controller/services"
@@ -45,14 +47,14 @@ var _ = Describe("RegistryDisk", func() {
 		tests.BeforeTestCleanup()
 	})
 
-	LaunchVM := func(vm *v1.VM) runtime.Object {
-		obj, err := virtClient.RestClient().Post().Resource("vms").Namespace(tests.NamespaceTestDefault).Body(vm).Do().Get()
+	LaunchVM := func(vm *v1.VirtualMachine) runtime.Object {
+		obj, err := virtClient.RestClient().Post().Resource("virtualmachines").Namespace(tests.NamespaceTestDefault).Body(vm).Do().Get()
 		Expect(err).To(BeNil())
 		return obj
 	}
 
-	VerifyRegistryDiskVM := func(vm *v1.VM, obj runtime.Object) {
-		_, ok := obj.(*v1.VM)
+	VerifyRegistryDiskVM := func(vm *v1.VirtualMachine, obj runtime.Object) {
+		_, ok := obj.(*v1.VirtualMachine)
 		Expect(ok).To(BeTrue(), "Object is not of type *v1.VM")
 		tests.WaitForSuccessfulVMStart(obj)
 
@@ -69,9 +71,7 @@ var _ = Describe("RegistryDisk", func() {
 					// only check readiness of disk containers
 					continue
 				}
-				if containerStatus.Ready == true {
-					disksFound++
-				}
+				disksFound++
 			}
 			break
 		}
@@ -79,9 +79,23 @@ var _ = Describe("RegistryDisk", func() {
 	}
 
 	Context("Ephemeral RegistryDisk", func() {
+		It("should be able to start and stop the same VM multiple times.", func(done Done) {
+			vm := tests.NewRandomVMWithEphemeralDisk("kubevirt/cirros-registry-disk-demo:devel")
+			num := 2
+			for i := 0; i < num; i++ {
+				obj, err := virtClient.RestClient().Post().Resource("virtualmachines").Namespace(tests.NamespaceTestDefault).Body(vm).Do().Get()
+				Expect(err).To(BeNil())
+				tests.WaitForSuccessfulVMStartWithTimeout(obj, 180)
+				_, err = virtClient.RestClient().Delete().Resource("virtualmachines").Namespace(vm.GetObjectMeta().GetNamespace()).Name(vm.GetObjectMeta().GetName()).Do().Get()
+				Expect(err).To(BeNil())
+				tests.NewObjectEventWatcher(obj).SinceWatchedObjectResourceVersion().WaitFor(tests.NormalEvent, v1.Deleted)
+			}
+			close(done)
+		}, 140)
+
 		It("should launch multiple VMs using ephemeral registry disks", func(done Done) {
 			num := 5
-			vms := make([]*v1.VM, 0, num)
+			vms := make([]*v1.VirtualMachine, 0, num)
 			objs := make([]runtime.Object, 0, num)
 			for i := 0; i < num; i++ {
 				vm := tests.NewRandomVMWithEphemeralDisk("kubevirt/cirros-registry-disk-demo:devel")
@@ -95,6 +109,16 @@ var _ = Describe("RegistryDisk", func() {
 			}
 
 			close(done)
-		}, 60) // Timeout is long because this test involves multiple parallel VM launches.
+		}, 120) // Timeout is long because this test involves multiple parallel VM launches.
+
+		It("should not modify the VM spec on status update", func() {
+			vm := tests.NewRandomVMWithEphemeralDisk("kubevirt/cirros-registry-disk-demo:devel")
+			vm, err := virtClient.VM(tests.NamespaceTestDefault).Create(vm)
+			Expect(err).To(BeNil())
+			tests.WaitForSuccessfulVMStartWithTimeout(vm, 60)
+			startedVM, err := virtClient.VM(tests.NamespaceTestDefault).Get(vm.ObjectMeta.Name, metav1.GetOptions{})
+			Expect(err).To(BeNil())
+			Expect(startedVM.Spec).To(Equal(vm.Spec))
+		})
 	})
 })

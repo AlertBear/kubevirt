@@ -22,6 +22,7 @@ package endpoints
 import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	ini "gopkg.in/ini.v1"
 
 	"net/http"
 
@@ -34,13 +35,12 @@ import (
 	"github.com/emicklei/go-restful"
 	"github.com/ghodss/yaml"
 	"golang.org/x/net/context"
-	"gopkg.in/ini.v1"
 
 	"kubevirt.io/kubevirt/pkg/rest"
 )
 
 func newValidGetRequest() *http.Request {
-	request, _ := http.NewRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/vms/test", nil)
+	request, _ := http.NewRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines/test", nil)
 	return request
 }
 
@@ -67,7 +67,7 @@ var _ = Describe("Get", func() {
 				rest.MIME_TEXT: NewEncodeINIResponse(http.StatusOK),
 				rest.MIME_YAML: NewEncodeYamlResponse(http.StatusOK),
 			})).Build(ctx))
-		ws.Route(ws.GET("/apis/kubevirt.io/v1alpha1/namespaces/{namespace}/vms/{name}").Produces(rest.MIME_JSON, rest.MIME_TEXT, rest.MIME_YAML).To(target))
+		ws.Route(ws.GET("/apis/kubevirt.io/v1alpha1/namespaces/{namespace}/virtualmachines/{name}").Produces(rest.MIME_JSON, rest.MIME_TEXT, rest.MIME_YAML).To(target))
 
 		request = newValidGetRequest()
 		recorder = httptest.NewRecorder()
@@ -94,7 +94,7 @@ var _ = Describe("Get", func() {
 				Expect(responseBody).To(Equal(payload{Name: "test", Email: "test@test.com", Metadata: Metadata{Name: "test", Namespace: "default"}}))
 			})
 			It("should detect labelSelector", func() {
-				request, _ := http.NewRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/vms/test?labelSelector=app%3Dmyapp", nil)
+				request, _ := http.NewRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines/test?labelSelector=app%3Dmyapp", nil)
 				handler.ServeHTTP(recorder, request)
 				responseBody := payload{}
 				json.NewDecoder(recorder.Body).Decode(&responseBody)

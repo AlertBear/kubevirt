@@ -30,12 +30,15 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	"kubevirt.io/kubevirt/pkg/api/v1"
 )
 
 type KubevirtClient interface {
 	VM(namespace string) VMInterface
 	Migration(namespace string) MigrationInterface
+	ReplicaSet(namespace string) ReplicaSetInterface
 	RestClient() *rest.RESTClient
 	kubernetes.Interface
 }
@@ -50,10 +53,19 @@ func (k kubevirt) RestClient() *rest.RESTClient {
 }
 
 type VMInterface interface {
-	Get(name string, options k8smetav1.GetOptions) (*v1.VM, error)
-	List(opts k8smetav1.ListOptions) (*v1.VMList, error)
-	Create(*v1.VM) (*v1.VM, error)
-	Update(*v1.VM) (*v1.VM, error)
+	Get(name string, options k8smetav1.GetOptions) (*v1.VirtualMachine, error)
+	List(opts k8smetav1.ListOptions) (*v1.VirtualMachineList, error)
+	Create(*v1.VirtualMachine) (*v1.VirtualMachine, error)
+	Update(*v1.VirtualMachine) (*v1.VirtualMachine, error)
+	Delete(name string, options *k8smetav1.DeleteOptions) error
+	Patch(name string, pt types.PatchType, data []byte, subresources ...string) (result *v1.VirtualMachine, err error)
+}
+
+type ReplicaSetInterface interface {
+	Get(name string, options k8smetav1.GetOptions) (*v1.VirtualMachineReplicaSet, error)
+	List(opts k8smetav1.ListOptions) (*v1.VirtualMachineReplicaSetList, error)
+	Create(*v1.VirtualMachineReplicaSet) (*v1.VirtualMachineReplicaSet, error)
+	Update(*v1.VirtualMachineReplicaSet) (*v1.VirtualMachineReplicaSet, error)
 	Delete(name string, options *k8smetav1.DeleteOptions) error
 }
 

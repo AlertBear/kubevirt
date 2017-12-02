@@ -2,17 +2,17 @@
 
 package v1
 
-func (VM) SwaggerDoc() map[string]string {
+func (VirtualMachine) SwaggerDoc() map[string]string {
 	return map[string]string{
-		"":       "VM is *the* VM Definition. It represents a virtual machine in the runtime environment of kubernetes.",
+		"":       "VirtualMachine is *the* VM Definition. It represents a virtual machine in the runtime environment of kubernetes.",
 		"spec":   "VM Spec contains the VM specification.",
 		"status": "Status is the high level overview of how the VM is doing. It contains information available to controllers and users.",
 	}
 }
 
-func (VMList) SwaggerDoc() map[string]string {
+func (VirtualMachineList) SwaggerDoc() map[string]string {
 	return map[string]string{
-		"": "VMList is a list of VMs",
+		"": "VirtualMachineList is a list of VirtualMachines",
 	}
 }
 
@@ -21,6 +21,14 @@ func (VMSpec) SwaggerDoc() map[string]string {
 		"":             "VMSpec is a description of a VM. Not to be confused with api.DomainSpec in virt-handler.\nIt is expected that v1.DomainSpec will be merged into this structure.",
 		"domain":       "Domain is the actual libvirt domain.",
 		"nodeSelector": "If labels are specified, only nodes marked with all of these labels are considered when scheduling the VM.",
+		"affinity":     "If affinity is specifies, obey all the affinity rules",
+	}
+}
+
+func (Affinity) SwaggerDoc() map[string]string {
+	return map[string]string{
+		"":             "Affinity groups all the affinity rules related to a VM",
+		"nodeAffinity": "Host affinity support",
 	}
 }
 
@@ -86,5 +94,45 @@ func (MigrationList) SwaggerDoc() map[string]string {
 func (MigrationHostInfo) SwaggerDoc() map[string]string {
 	return map[string]string{
 		"": "Host specific data, used by the migration controller to fetch host specific migration information from the target host",
+	}
+}
+
+func (VirtualMachineReplicaSet) SwaggerDoc() map[string]string {
+	return map[string]string{
+		"":       "VM is *the* VM Definition. It represents a virtual machine in the runtime environment of kubernetes.",
+		"spec":   "VM Spec contains the VM specification.",
+		"status": "Status is the high level overview of how the VM is doing. It contains information available to controllers and users.",
+	}
+}
+
+func (VirtualMachineReplicaSetList) SwaggerDoc() map[string]string {
+	return map[string]string{
+		"": "VMList is a list of VMs",
+	}
+}
+
+func (VMReplicaSetSpec) SwaggerDoc() map[string]string {
+	return map[string]string{
+		"replicas": "Number of desired pods. This is a pointer to distinguish between explicit\nzero and not specified. Defaults to 1.\n+optional",
+		"selector": "Label selector for pods. Existing ReplicaSets whose pods are\nselected by this will be the ones affected by this deployment.\n+optional",
+		"template": "Template describes the pods that will be created.",
+		"paused":   "Indicates that the replica set is paused.\n+optional",
+	}
+}
+
+func (VMReplicaSetStatus) SwaggerDoc() map[string]string {
+	return map[string]string{
+		"replicas":      "Total number of non-terminated pods targeted by this deployment (their labels match the selector).\n+optional",
+		"readyReplicas": "The number of ready replicas for this replica set.\n+optional",
+	}
+}
+
+func (VMReplicaSetCondition) SwaggerDoc() map[string]string {
+	return map[string]string{}
+}
+
+func (VMTemplateSpec) SwaggerDoc() map[string]string {
+	return map[string]string{
+		"spec": "VM Spec contains the VM specification.",
 	}
 }

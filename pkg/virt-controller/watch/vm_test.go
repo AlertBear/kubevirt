@@ -37,7 +37,7 @@ import (
 
 	v1 "kubevirt.io/kubevirt/pkg/api/v1"
 	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/log"
 	"kubevirt.io/kubevirt/pkg/virt-controller/services"
 )
 
@@ -45,7 +45,7 @@ var _ = Describe("VM watcher", func() {
 	var server *ghttp.Server
 	//var vmService services.VMService
 
-	logging.DefaultLogger().SetIOWriter(GinkgoWriter)
+	log.Log.SetIOWriter(GinkgoWriter)
 
 	var app VirtControllerApp = VirtControllerApp{}
 	app.launcherImage = "kubevirt/virt-launcher"
@@ -88,7 +88,7 @@ var _ = Describe("VM watcher", func() {
 			podListPostCreate := clientv1.PodList{}
 			podListPostCreate.Items = []clientv1.Pod{*pod}
 
-			expectedVM := obj.(*v1.VM)
+			expectedVM := obj.(*v1.VirtualMachine)
 			expectedVM.Status.Phase = v1.Scheduling
 			expectedVM.Status.MigrationNodeName = pod.Spec.NodeName
 
@@ -104,7 +104,7 @@ var _ = Describe("VM watcher", func() {
 				),
 
 				ghttp.CombineHandlers(
-					ghttp.VerifyRequest("PUT", "/apis/kubevirt.io/v1alpha1/namespaces/default/vms/testvm"),
+					ghttp.VerifyRequest("PUT", "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines/testvm"),
 					ghttp.RespondWithJSONEncoded(http.StatusOK, vm),
 				),
 			)
@@ -126,7 +126,7 @@ var _ = Describe("VM watcher", func() {
 			vm.Status.Phase = ""
 			vm.ObjectMeta.SetUID(uuid.NewUUID())
 			vm.Spec.Domain.Devices.Disks = append(vm.Spec.Domain.Devices.Disks, v1.Disk{
-				Type:   "ContainerRegistryDisk:v1alpha",
+				Type:   "RegistryDisk:v1alpha",
 				Device: "disk",
 				Source: v1.DiskSource{
 					Name: "someimage:v1.2.3.4",
@@ -134,14 +134,7 @@ var _ = Describe("VM watcher", func() {
 				Target: v1.DiskTarget{
 					Device: "vda",
 				},
-				Auth: &v1.DiskAuth{
-					Username: "fake",
-				},
 			})
-			vm.Spec.Domain.Devices.Disks[0].Source.Host = &v1.DiskSourceHost{
-				Port: "4444",
-				Name: "127.0.0.1",
-			}
 
 			// Create a Pod for the VM
 			templateService, err := services.NewTemplateService("whatever", "whatever", "whatever")
@@ -150,7 +143,7 @@ var _ = Describe("VM watcher", func() {
 			// We want to ensure the vm object we initially post
 			// doesn't have ports set, so we make a copy in order
 			// to render the pod object early for the test.
-			vmCopy := v1.VM{}
+			vmCopy := v1.VirtualMachine{}
 			model.Copy(&vmCopy, vm)
 
 			pod, err := templateService.RenderLaunchManifest(&vmCopy)
@@ -171,8 +164,6 @@ var _ = Describe("VM watcher", func() {
 			podListPostCreate := clientv1.PodList{}
 			podListPostCreate.Items = []clientv1.Pod{*pod}
 
-			secret := clientv1.Secret{}
-
 			// Register the expected REST call
 			server.AppendHandlers(
 				ghttp.CombineHandlers(
@@ -180,16 +171,11 @@ var _ = Describe("VM watcher", func() {
 					ghttp.RespondWithJSONEncoded(http.StatusOK, podListInitial),
 				),
 				ghttp.CombineHandlers(
-					ghttp.VerifyRequest("GET", "/api/v1/namespaces/default/secrets/registrydisk-iscsi-default-testvm"),
-					ghttp.RespondWithJSONEncoded(http.StatusOK, secret),
-				),
-				ghttp.CombineHandlers(
 					ghttp.VerifyRequest("POST", "/api/v1/namespaces/default/pods"),
 					ghttp.RespondWithJSONEncoded(http.StatusOK, pod),
 				),
-
 				ghttp.CombineHandlers(
-					ghttp.VerifyRequest("PUT", "/apis/kubevirt.io/v1alpha1/namespaces/default/vms/testvm"),
+					ghttp.VerifyRequest("PUT", "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines/testvm"),
 					ghttp.RespondWithJSONEncoded(http.StatusOK, vm),
 				),
 			)
@@ -200,7 +186,7 @@ var _ = Describe("VM watcher", func() {
 			app.vmQueue.Add(key)
 			app.vmController.Execute()
 
-			Expect(len(server.ReceivedRequests())).To(Equal(4))
+			Expect(len(server.ReceivedRequests())).To(Equal(3))
 			close(done)
 		}, 10)
 	})
@@ -229,7 +215,7 @@ var _ = Describe("VM watcher", func() {
 			obj, err := conversion.NewCloner().DeepCopy(vm)
 			Expect(err).ToNot(HaveOccurred())
 
-			expectedVM := obj.(*v1.VM)
+			expectedVM := obj.(*v1.VirtualMachine)
 			expectedVM.Status.Phase = v1.Scheduled
 			expectedVM.Status.NodeName = pod.Spec.NodeName
 			expectedVM.ObjectMeta.Labels = map[string]string{v1.NodeNameLabel: pod.Spec.NodeName}
@@ -241,7 +227,7 @@ var _ = Describe("VM watcher", func() {
 					ghttp.RespondWithJSONEncoded(http.StatusOK, pods),
 				),
 				ghttp.CombineHandlers(
-					ghttp.VerifyRequest("PUT", "/apis/kubevirt.io/v1alpha1/namespaces/default/vms/testvm"),
+					ghttp.VerifyRequest("PUT", "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines/testvm"),
 					ghttp.VerifyJSONRepresenting(expectedVM),
 					ghttp.RespondWithJSONEncoded(http.StatusOK, expectedVM),
 				),

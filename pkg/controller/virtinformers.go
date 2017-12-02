@@ -17,9 +17,10 @@
  *
  */
 
-package informers
+package controller
 
 import (
+	"math/rand"
 	"sync"
 	"time"
 
@@ -30,10 +31,9 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
-	"kubevirt.io/kubevirt/pkg/kubecli"
-
 	kubev1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/kubecli"
+	"kubevirt.io/kubevirt/pkg/log"
 )
 
 type newSharedInformer func() cache.SharedIndexInformer
@@ -47,6 +47,8 @@ type KubeInformerFactory interface {
 	VM() cache.SharedIndexInformer
 	// Watches for migration objects
 	Migration() cache.SharedIndexInformer
+
+	VMReplicaSet() cache.SharedIndexInformer
 	// Watches for pods related only to kubevirt
 	KubeVirtPod() cache.SharedIndexInformer
 }
@@ -63,9 +65,10 @@ type kubeInformerFactory struct {
 
 func NewKubeInformerFactory(restClient *rest.RESTClient, clientSet kubecli.KubevirtClient) KubeInformerFactory {
 	return &kubeInformerFactory{
-		restClient:       restClient,
-		clientSet:        clientSet,
-		defaultResync:    0,
+		restClient: restClient,
+		clientSet:  clientSet,
+		// Resulting resync period will be between 12 and 24 hours, like the default for k8s
+		defaultResync:    resyncPeriod(12 * time.Hour),
 		informers:        make(map[string]cache.SharedIndexInformer),
 		startedInformers: make(map[string]bool),
 	}
@@ -81,9 +84,10 @@ func (f *kubeInformerFactory) Start(stopCh <-chan struct{}) {
 	for name, informer := range f.informers {
 		if f.startedInformers[name] {
 			// skip informers that have already started.
+			log.Log.Infof("SKIPPING informer %s", name)
 			continue
 		}
-		logging.DefaultLogger().Info().Msgf("STARTING informer %s", name)
+		log.Log.Infof("STARTING informer %s", name)
 		go informer.Run(stopCh)
 		f.startedInformers[name] = true
 	}
@@ -108,8 +112,8 @@ func (f *kubeInformerFactory) getInformer(key string, newFunc newSharedInformer)
 
 func (f *kubeInformerFactory) VM() cache.SharedIndexInformer {
 	return f.getInformer("vmInformer", func() cache.SharedIndexInformer {
-		lw := cache.NewListWatchFromClient(f.restClient, "vms", k8sv1.NamespaceAll, fields.Everything())
-		return cache.NewSharedIndexInformer(lw, &kubev1.VM{}, f.defaultResync, cache.Indexers{})
+		lw := cache.NewListWatchFromClient(f.restClient, "virtualmachines", k8sv1.NamespaceAll, fields.Everything())
+		return cache.NewSharedIndexInformer(lw, &kubev1.VirtualMachine{}, f.defaultResync, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	})
 }
 
@@ -117,6 +121,13 @@ func (f *kubeInformerFactory) Migration() cache.SharedIndexInformer {
 	return f.getInformer("migrationInformer", func() cache.SharedIndexInformer {
 		lw := cache.NewListWatchFromClient(f.restClient, "migrations", k8sv1.NamespaceAll, fields.Everything())
 		return cache.NewSharedIndexInformer(lw, &kubev1.Migration{}, f.defaultResync, cache.Indexers{})
+	})
+}
+
+func (f *kubeInformerFactory) VMReplicaSet() cache.SharedIndexInformer {
+	return f.getInformer("vmrsInformer", func() cache.SharedIndexInformer {
+		lw := cache.NewListWatchFromClient(f.restClient, "virtualmachinereplicasets", k8sv1.NamespaceAll, fields.Everything())
+		return cache.NewSharedIndexInformer(lw, &kubev1.VirtualMachineReplicaSet{}, f.defaultResync, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	})
 }
 
@@ -128,7 +139,13 @@ func (f *kubeInformerFactory) KubeVirtPod() cache.SharedIndexInformer {
 			panic(err)
 		}
 
-		lw := kubecli.NewListWatchFromClient(f.clientSet.CoreV1().RESTClient(), "pods", k8sv1.NamespaceAll, fields.Everything(), labelSelector)
+		lw := NewListWatchFromClient(f.clientSet.CoreV1().RESTClient(), "pods", k8sv1.NamespaceAll, fields.Everything(), labelSelector)
 		return cache.NewSharedIndexInformer(lw, &k8sv1.Pod{}, f.defaultResync, cache.Indexers{})
 	})
+}
+
+// resyncPeriod computes the time interval a shared informer waits before resyncing with the api server
+func resyncPeriod(minResyncPeriod time.Duration) time.Duration {
+	factor := rand.Float64() + 1
+	return time.Duration(float64(minResyncPeriod.Nanoseconds()) * factor)
 }

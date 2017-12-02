@@ -33,7 +33,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/log"
 	"kubevirt.io/kubevirt/pkg/virt-handler/virtwrap/api"
 	"kubevirt.io/kubevirt/pkg/virt-handler/virtwrap/cli"
 	"kubevirt.io/kubevirt/pkg/virt-handler/virtwrap/isolation"
@@ -49,7 +49,7 @@ var _ = Describe("Manager", func() {
 	testNamespace := "testnamespace"
 	testDomainName := fmt.Sprintf("%s_%s", testNamespace, testVmName)
 
-	logging.DefaultLogger().SetIOWriter(GinkgoWriter)
+	log.Log.SetIOWriter(GinkgoWriter)
 
 	BeforeEach(func() {
 		ctrl = gomock.NewController(GinkgoT())
@@ -61,7 +61,7 @@ var _ = Describe("Manager", func() {
 		mockDomain.EXPECT().Free()
 	})
 
-	expectIsolationDetectionForVM := func(vm *v1.VM) *api.DomainSpec {
+	expectIsolationDetectionForVM := func(vm *v1.VirtualMachine) *api.DomainSpec {
 		var domainSpec api.DomainSpec
 		Expect(model.Copy(&domainSpec, vm.Spec.Domain)).To(BeEmpty())
 
@@ -71,7 +71,6 @@ var _ = Describe("Manager", func() {
 			QEMUEnv: []api.Env{
 				{Name: "SLICE", Value: "dfd"},
 				{Name: "CONTROLLERS", Value: "a,b"},
-				{Name: "PIDNS", Value: "/proc/1234/ns/pid"},
 			},
 		}
 		isolationResult := isolation.NewIsolationResult(1234, "dfd", []string{"a", "b"})
@@ -200,8 +199,8 @@ var _ = Describe("Manager", func() {
 	})
 })
 
-func newVM(namespace string, name string) *v1.VM {
-	return &v1.VM{
+func newVM(namespace string, name string) *v1.VirtualMachine {
+	return &v1.VirtualMachine{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec:       v1.VMSpec{Domain: v1.NewMinimalDomainSpec()},
 	}

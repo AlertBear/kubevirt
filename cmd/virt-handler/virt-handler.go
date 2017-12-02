@@ -20,7 +20,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -29,19 +28,22 @@ import (
 
 	"github.com/emicklei/go-restful"
 	"github.com/libvirt/libvirt-go"
-	"github.com/spf13/pflag"
+	flag "github.com/spf13/pflag"
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes/scheme"
 	k8coresv1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
 	"kubevirt.io/kubevirt/pkg/api/v1"
 	cloudinit "kubevirt.io/kubevirt/pkg/cloud-init"
 	configdisk "kubevirt.io/kubevirt/pkg/config-disk"
+	"kubevirt.io/kubevirt/pkg/controller"
 	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/log"
+	registrydisk "kubevirt.io/kubevirt/pkg/registry-disk"
 	"kubevirt.io/kubevirt/pkg/service"
 	"kubevirt.io/kubevirt/pkg/virt-handler"
 	"kubevirt.io/kubevirt/pkg/virt-handler/rest"
@@ -50,39 +52,57 @@ import (
 	virtcache "kubevirt.io/kubevirt/pkg/virt-handler/virtwrap/cache"
 	virtcli "kubevirt.io/kubevirt/pkg/virt-handler/virtwrap/cli"
 	"kubevirt.io/kubevirt/pkg/virt-handler/virtwrap/isolation"
+	watchdog "kubevirt.io/kubevirt/pkg/watchdog"
+)
+
+const (
+	defaultWatchdogTimeout = 30 * time.Second
+
+	// Default port that virt-handler listens on.
+	defaultPort = 8185
+
+	// Default address that virt-handler listens on.
+	defaultHost = "0.0.0.0"
+
+	// The URI connection string supplied to libvirt. By default, we connect to system-mode daemon of QEMU.
+	libvirtUri = "qemu:///system"
+
+	hostOverride = ""
+
+	virtShareDir = "/var/run/kubevirt"
+
+	ephemeralDiskDir = "/var/run/libvirt/kubevirt-ephemeral-disk"
 )
 
 type virtHandlerApp struct {
-	Service      *service.Service
-	HostOverride string
-	LibvirtUri   string
-	SocketDir    string
-	CloudInitDir string
+	service.ServiceListen
+	service.ServiceLibvirt
+	HostOverride            string
+	VirtShareDir            string
+	EphemeralDiskDir        string
+	WatchdogTimeoutDuration time.Duration
 }
 
-func newVirtHandlerApp(host *string, port *int, hostOverride *string, libvirtUri *string, socketDir *string, cloudInitDir *string) *virtHandlerApp {
-	if *hostOverride == "" {
+var _ service.Service = &virtHandlerApp{}
+
+func (app *virtHandlerApp) Run() {
+	// HostOverride should default to os.Hostname(), to make sure we handle errors ensure it here.
+	if app.HostOverride == "" {
 		defaultHostName, err := os.Hostname()
 		if err != nil {
 			panic(err)
 		}
-		*hostOverride = defaultHostName
+		app.HostOverride = defaultHostName
 	}
 
-	return &virtHandlerApp{
-		Service:      service.NewService("virt-handler", host, port),
-		HostOverride: *hostOverride,
-		LibvirtUri:   *libvirtUri,
-		SocketDir:    *socketDir,
-		CloudInitDir: *cloudInitDir,
+	logger := log.Log
+	logger.V(1).Level(log.INFO).Log("hostname", app.HostOverride)
+
+	err := cloudinit.SetLocalDirectory(app.EphemeralDiskDir + "/cloud-init-data")
+	if err != nil {
+		panic(err)
 	}
-}
-
-func (app *virtHandlerApp) Run() {
-	log := logging.DefaultLogger()
-	log.Info().V(1).Log("hostname", app.HostOverride)
-
-	err := cloudinit.SetLocalDirectory(app.CloudInitDir)
+	err = registrydisk.SetLocalDirectory(app.EphemeralDiskDir + "/registry-disk-data")
 	if err != nil {
 		panic(err)
 	}
@@ -91,7 +111,7 @@ func (app *virtHandlerApp) Run() {
 		for {
 			if res := libvirt.EventRunDefaultImpl(); res != nil {
 				// Report the error somehow or break the loop.
-				log.Error().Reason(res).Msg("Listening to libvirt events failed.")
+				logger.Reason(res).Error("Listening to libvirt events failed.")
 			}
 		}
 	}()
@@ -113,7 +133,7 @@ func (app *virtHandlerApp) Run() {
 
 	domainManager, err := virtwrap.NewLibvirtDomainManager(domainConn,
 		recorder,
-		isolation.NewSocketBasedIsolationDetector(app.SocketDir),
+		isolation.NewSocketBasedIsolationDetector(app.VirtShareDir),
 	)
 	if err != nil {
 		panic(err)
@@ -127,71 +147,87 @@ func (app *virtHandlerApp) Run() {
 	configDiskClient := configdisk.NewConfigDiskClient(virtCli)
 
 	// Wire VM controller
-	vmListWatcher := kubecli.NewListWatchFromClient(virtCli.RestClient(), "vms", k8sv1.NamespaceAll, fields.Everything(), l)
-	vmStore, vmQueue, vmController := virthandler.NewVMController(vmListWatcher, domainManager, recorder, *virtCli.RestClient(), virtCli, app.HostOverride, configDiskClient)
 
 	// Wire Domain controller
 	domainSharedInformer, err := virtcache.NewSharedInformer(domainConn)
 	if err != nil {
 		panic(err)
 	}
-	domainStore, domainController := virthandler.NewDomainController(vmQueue, vmStore, domainSharedInformer, *virtCli.RestClient(), recorder)
 
-	if err != nil {
-		panic(err)
-	}
+	vmSharedInformer := cache.NewSharedIndexInformer(
+		controller.NewListWatchFromClient(virtCli.RestClient(), "virtualmachines", k8sv1.NamespaceAll, fields.Everything(), l),
+		&v1.VirtualMachine{},
+		0,
+		cache.Indexers{},
+	)
+
+	watchdogInformer := cache.NewSharedIndexInformer(
+		watchdog.NewWatchdogListWatchFromClient(
+			app.VirtShareDir,
+			int(app.WatchdogTimeoutDuration.Seconds())),
+		&virt_api.Domain{},
+		0,
+		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+
+	vmController := virthandler.NewController(
+		domainManager,
+		recorder,
+		virtCli,
+		app.HostOverride,
+		configDiskClient,
+		app.VirtShareDir,
+		int(app.WatchdogTimeoutDuration.Seconds()),
+		vmSharedInformer,
+		domainSharedInformer,
+		watchdogInformer,
+	)
 
 	// Bootstrapping. From here on the startup order matters
 	stop := make(chan struct{})
 	defer close(stop)
 
-	// Start domain controller and wait for Domain cache sync
-	domainController.StartInformer(stop)
-	domainController.WaitForSync(stop)
-
-	// Poplulate the VM store with known Domains on the host, to get deletes since the last run
-	for _, domain := range domainStore.List() {
-		d := domain.(*virt_api.Domain)
-		vmStore.Add(v1.NewVMReferenceFromNameWithNS(d.ObjectMeta.Namespace, d.ObjectMeta.Name))
-	}
-
-	// Watch for VM changes
-	vmController.StartInformer(stop)
-	vmController.WaitForSync(stop)
-
-	err = configDiskClient.UndefineUnseen(vmStore)
-	if err != nil {
-		panic(err)
-	}
-
-	go domainController.Run(3, stop)
 	go vmController.Run(3, stop)
 
 	// TODO add a http handler which provides health check
 
 	// Add websocket route to access consoles remotely
 	console := rest.NewConsoleResource(domainConn)
-	migrationHostInfo := rest.NewMigrationHostInfo(isolation.NewSocketBasedIsolationDetector(app.SocketDir))
+	migrationHostInfo := rest.NewMigrationHostInfo(isolation.NewSocketBasedIsolationDetector(app.VirtShareDir))
 	ws := new(restful.WebService)
-	ws.Route(ws.GET("/api/v1/namespaces/{namespace}/vms/{name}/console").To(console.Console))
-	ws.Route(ws.GET("/api/v1/namespaces/{namespace}/vms/{name}/migrationHostInfo").To(migrationHostInfo.MigrationHostInfo))
+	ws.Route(ws.GET("/api/v1/namespaces/{namespace}/virtualmachines/{name}/console").To(console.Console))
+	ws.Route(ws.GET("/api/v1/namespaces/{namespace}/virtualmachines/{name}/migrationHostInfo").To(migrationHostInfo.MigrationHostInfo))
 	restful.DefaultContainer.Add(ws)
-	server := &http.Server{Addr: app.Service.Address(), Handler: restful.DefaultContainer}
+	server := &http.Server{Addr: app.Address(), Handler: restful.DefaultContainer}
 	server.ListenAndServe()
 }
 
-func main() {
-	logging.InitializeLogging("virt-handler")
-	libvirt.EventRegisterDefaultImpl()
-	libvirtUri := flag.String("libvirt-uri", "qemu:///system", "Libvirt connection string.")
-	host := flag.String("listen", "0.0.0.0", "Address where to listen on")
-	port := flag.Int("port", 8185, "Port to listen on")
-	hostOverride := flag.String("hostname-override", "", "Kubernetes Pod to monitor for changes")
-	socketDir := flag.String("socket-dir", "/var/run/kubevirt", "Directory where to look for sockets for cgroup detection")
-	cloudInitDir := flag.String("cloud-init-dir", "/var/run/libvirt/cloud-init-dir", "Base directory for ephemeral cloud init data")
-	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
-	pflag.Parse()
+func (app *virtHandlerApp) AddFlags() {
+	app.InitFlags()
 
-	app := newVirtHandlerApp(host, port, hostOverride, libvirtUri, socketDir, cloudInitDir)
+	app.BindAddress = defaultHost
+	app.Port = defaultPort
+	app.LibvirtUri = libvirtUri
+
+	app.AddCommonFlags()
+	app.AddLibvirtFlags()
+
+	flag.StringVar(&app.HostOverride, "hostname-override", hostOverride,
+		"Name under which the node is registered in kubernetes, where this virt-handler instance is running on")
+
+	flag.StringVar(&app.VirtShareDir, "kubevirt-share-dir", virtShareDir,
+		"Shared directory between virt-handler and virt-launcher")
+
+	flag.StringVar(&app.EphemeralDiskDir, "ephemeral-disk-dir", ephemeralDiskDir,
+		"Base directory for ephemeral disk data")
+
+	flag.DurationVar(&app.WatchdogTimeoutDuration, "watchdog-timeout", defaultWatchdogTimeout,
+		"Watchdog file timeout")
+}
+
+func main() {
+	log.InitializeLogging("virt-handler")
+	libvirt.EventRegisterDefaultImpl()
+	app := &virtHandlerApp{}
+	service.Setup(app)
 	app.Run()
 }

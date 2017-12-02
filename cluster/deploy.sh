@@ -21,16 +21,46 @@ set -ex
 
 KUBECTL=${KUBECTL:-kubectl}
 
+externalServiceManifests()
+{
+  source hack/config.sh
+
+  # Pretty much equivalent to `kubectl expose service ...`
+  for SVC in spice-proxy:3128 virt-api:8182 haproxy:8184 virt-manifest:8186;
+  do
+    IFS=: read NAME PORT <<<$SVC
+    cat <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-$NAME
+  namespace: kube-system
+spec:
+  externalIPs:
+  - "$master_ip"
+  ports:
+    - port: $PORT
+      targetPort: $PORT
+  selector:
+    app: $NAME
+---
+EOF
+  done
+}
+
 echo "Cleaning up ..."
 # Work around https://github.com/kubernetes/kubernetes/issues/33517
-cluster/kubectl.sh --core delete -f manifests/virt-handler.yaml --cascade=false --grace-period 0 2>/dev/null || :
-cluster/kubectl.sh --core delete pods -l=daemon=virt-handler --force --grace-period 0 2>/dev/null || :
+$KUBECTL delete -f manifests/virt-handler.yaml --cascade=false --grace-period 0 2>/dev/null || :
+$KUBECTL delete pods -n kube-system -l=daemon=virt-handler --force --grace-period 0 2>/dev/null || :
 
-cluster/kubectl.sh --core delete -f manifests/libvirt.yaml --cascade=false --grace-period 0 2>/dev/null || :
-cluster/kubectl.sh --core delete pods -l=daemon=libvirt --force --grace-period 0 2>/dev/null || :
+$KUBECTL delete -f manifests/libvirt.yaml --cascade=false --grace-period 0 2>/dev/null || :
+$KUBECTL delete pods -n kube-system -l=daemon=libvirt --force --grace-period 0 2>/dev/null || :
 
-# Make sure TPRs are deleted, we use CRDs now
-cluster/kubectl.sh --core delete thirdpartyresources --all  || :
+# Make sure that the vms CRD is deleted, we use virtualmachines now
+$KUBECTL delete customresourcedefinitions vms.kubevirt.io  || :
+
+# Remove all external facing services
+externalServiceManifests | cluster/kubectl.sh --core delete -f - || :
 
 # Delete everything else
 for i in `ls manifests/*.yaml`; do
@@ -40,6 +70,8 @@ done
 sleep 2
 
 echo "Deploying ..."
+externalServiceManifests | cluster/kubectl.sh --core apply -f -
+
 for i in `ls manifests/*.yaml`; do
     $KUBECTL create -f $i
 done

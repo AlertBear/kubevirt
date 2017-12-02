@@ -28,11 +28,11 @@ package v1
 // http://cloudinit.readthedocs.io/en/latest/topics/datasources/nocloud.html
 type CloudInitDataSourceNoCloud struct {
 	// Reference to a k8s secret that contains NoCloud userdata
-	UserDataSecretRef string `json:"userDataSecretRef"`
+	UserDataSecretRef string `json:"userDataSecretRef,omitempty"`
 	// The NoCloud cloud-init userdata as a base64 encoded string
 	UserDataBase64 string `json:"userDataBase64"`
 	// The NoCloud cloud-init metadata as a base64 encoded string
-	MetaDataBase64 string `json:"metaDataBase64"`
+	MetaDataBase64 string `json:"metaDataBase64,omitempty"`
 }
 
 // Only one of the fields in the CloudInitSpec can be set
@@ -67,15 +67,16 @@ type Devices struct {
 	Disks      []Disk      `json:"disks,omitempty"`
 	Serials    []Serial    `json:"serials,omitempty"`
 	Consoles   []Console   `json:"consoles,omitempty"`
+	Watchdog   *Watchdog   `json:"watchdog,omitempty"`
 }
 
 // BEGIN Disk -----------------------------
 
 type Disk struct {
-	Device    string         `json:"device"`
+	Device    string         `json:"device,omitempty"`
 	Snapshot  string         `json:"snapshot,omitempty"`
 	Type      string         `json:"type"`
-	Source    DiskSource     `json:"source"`
+	Source    DiskSource     `json:"source,omitempty"`
 	Target    DiskTarget     `json:"target"`
 	Serial    string         `json:"serial,omitempty"`
 	Driver    *DiskDriver    `json:"driver,omitempty"`
@@ -210,7 +211,7 @@ type Alias struct {
 type OS struct {
 	Type      OSType    `json:"type"`
 	SMBios    *SMBios   `json:"smBIOS,omitempty"`
-	BootOrder []Boot    `json:"bootOrder"`
+	BootOrder []Boot    `json:"bootOrder,omitempty"`
 	BootMenu  *BootMenu `json:"bootMenu,omitempty"`
 	BIOS      *BIOS     `json:"bios,omitempty"`
 }
@@ -340,6 +341,14 @@ type Ballooning struct {
 }
 
 type RandomGenerator struct {
+}
+
+// Hardware watchdog device
+type Watchdog struct {
+	// Defines what watchdog model to use, typically 'i6300esb'
+	Model string `json:"model"`
+	// The action to take. poweroff, reset, shutdown, pause, dump.
+	Action string `json:"action"`
 }
 
 // TODO ballooning, rng, cpu ...

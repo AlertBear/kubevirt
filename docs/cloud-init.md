@@ -37,12 +37,12 @@ Example
 metadata:
   name: testvm-nocloud
 apiVersion: kubevirt.io/v1alpha1
-kind: VM
+kind: VirtualMachine
 spec:
   domain:
     devices:
       disks:
-      - type: ContainerRegistryDisk:v1alpha
+      - type: RegistryDisk:v1alpha
         source:
           name: kubevirt/cirros-registry-disk-demo:devel
         target:
@@ -95,12 +95,12 @@ Then reference the secret in the userDataSecretRef field.
 metadata:
   name: testvm-nocloud
 apiVersion: kubevirt.io/v1alpha1
-kind: VM
+kind: VirtualMachine
 spec:
   domain:
     devices:
       disks:
-      - type: ContainerRegistryDisk:v1alpha
+      - type: RegistryDisk:v1alpha
         source:
           name: kubevirt/cirros-registry-disk-demo:devel
         target:

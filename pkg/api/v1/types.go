@@ -30,10 +30,11 @@ import (
 	"fmt"
 	"reflect"
 
-	model "github.com/jeevatkm/go-model"
-	uuid "github.com/satori/go.uuid"
+	"github.com/jeevatkm/go-model"
+	"github.com/satori/go.uuid"
 
 	k8sv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apimachinery/announced"
 	"k8s.io/apimachinery/pkg/apimachinery/registered"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -52,9 +53,11 @@ const GroupName = "kubevirt.io"
 var GroupVersion = schema.GroupVersion{Group: GroupName, Version: "v1alpha1"}
 
 // GroupVersionKind
-var VMGroupVersionKind = schema.GroupVersionKind{Group: GroupName, Version: GroupVersion.Version, Kind: "VM"}
+var VirtualMachineGroupVersionKind = schema.GroupVersionKind{Group: GroupName, Version: GroupVersion.Version, Kind: "VirtualMachine"}
 
 var MigrationGroupVersionKind = schema.GroupVersionKind{Group: GroupName, Version: GroupVersion.Version, Kind: "Migration"}
+
+var VMReplicaSetGroupVersionKind = schema.GroupVersionKind{Group: GroupName, Version: GroupVersion.Version, Kind: "VirtualMachineReplicaSet"}
 
 var (
 	groupFactoryRegistry = make(announced.APIGroupFactoryRegistry)
@@ -64,13 +67,15 @@ var (
 // Adds the list of known types to api.Scheme.
 func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(GroupVersion,
-		&VM{},
-		&VMList{},
+		&VirtualMachine{},
+		&VirtualMachineList{},
 		&metav1.ListOptions{},
 		&metav1.DeleteOptions{},
 		&Spice{},
 		&Migration{},
 		&MigrationList{},
+		&VirtualMachineReplicaSet{},
+		&VirtualMachineReplicaSetList{},
 		&metav1.GetOptions{},
 	)
 	return nil
@@ -82,7 +87,6 @@ func init() {
 		&announced.GroupMetaFactoryArgs{
 			GroupName:              GroupName,
 			VersionPreferenceOrder: []string{GroupVersion.Version},
-			ImportPrefix:           "kubevirt.io/kubevirt/pkg/api/v1",
 		},
 		announced.VersionToSchemeFunc{
 			GroupVersion.Version: SchemeBuilder.AddToScheme,
@@ -100,21 +104,71 @@ func init() {
 	})
 }
 
-// VM is *the* VM Definition. It represents a virtual machine in the runtime environment of kubernetes.
-type VM struct {
-	metav1.TypeMeta `json:",inline"`
-	ObjectMeta      metav1.ObjectMeta `json:"metadata,omitempty"`
+// VirtualMachine is *the* VM Definition. It represents a virtual machine in the runtime environment of kubernetes.
+type VirtualMachine struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 	// VM Spec contains the VM specification.
 	Spec VMSpec `json:"spec,omitempty" valid:"required"`
 	// Status is the high level overview of how the VM is doing. It contains information available to controllers and users.
-	Status VMStatus `json:"status"`
+	Status VMStatus `json:"status,omitempty"`
 }
 
-// VMList is a list of VMs
-type VMList struct {
+func (in *VirtualMachine) DeepCopyInto(out *VirtualMachine) {
+	err := model.Copy(out, in)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func (in *VirtualMachine) DeepCopy() *VirtualMachine {
+	if in == nil {
+		return nil
+	}
+	out := new(VirtualMachine)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *VirtualMachine) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	} else {
+		return nil
+	}
+}
+
+// VirtualMachineList is a list of VirtualMachines
+type VirtualMachineList struct {
 	metav1.TypeMeta `json:",inline"`
-	ListMeta        metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []VM            `json:"items"`
+	ListMeta        metav1.ListMeta  `json:"metadata,omitempty"`
+	Items           []VirtualMachine `json:"items"`
+}
+
+func (in *VirtualMachineList) DeepCopyInto(out *VirtualMachineList) {
+	err := model.Copy(out, in)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func (in *VirtualMachineList) DeepCopy() *VirtualMachineList {
+	if in == nil {
+		return nil
+	}
+	out := new(VirtualMachineList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *VirtualMachineList) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	} else {
+		return nil
+	}
 }
 
 // VMSpec is a description of a VM. Not to be confused with api.DomainSpec in virt-handler.
@@ -124,6 +178,14 @@ type VMSpec struct {
 	Domain *DomainSpec `json:"domain,omitempty"`
 	// If labels are specified, only nodes marked with all of these labels are considered when scheduling the VM.
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	// If affinity is specifies, obey all the affinity rules
+	Affinity *Affinity `json:"affinity,omitempty"`
+}
+
+// Affinity groups all the affinity rules related to a VM
+type Affinity struct {
+	// Host affinity support
+	NodeAffinity *k8sv1.NodeAffinity `json:"nodeAffinity,omitempty"`
 }
 
 // VMStatus represents information about the status of a VM. Status may trail the actual
@@ -136,9 +198,9 @@ type VMStatus struct {
 	// Conditions are specific points in VM's pod runtime.
 	Conditions []VMCondition `json:"conditions,omitempty"`
 	// Phase is the status of the VM in kubernetes world. It is not the VM status, but partially correlates to it.
-	Phase VMPhase `json:"phase"`
+	Phase VMPhase `json:"phase,omitempty"`
 	// Graphics represent the details of available graphical consoles.
-	Graphics []VMGraphics `json:"graphics"`
+	Graphics []VMGraphics `json:"graphics" optional:"true"`
 }
 
 type VMGraphics struct {
@@ -148,72 +210,82 @@ type VMGraphics struct {
 }
 
 // Required to satisfy Object interface
-func (v *VM) GetObjectKind() schema.ObjectKind {
+func (v *VirtualMachine) GetObjectKind() schema.ObjectKind {
 	return &v.TypeMeta
 }
 
 // Required to satisfy ObjectMetaAccessor interface
-func (v *VM) GetObjectMeta() metav1.Object {
+func (v *VirtualMachine) GetObjectMeta() metav1.Object {
 	return &v.ObjectMeta
 }
 
-func (v *VM) IsRunning() bool {
+func (v *VirtualMachine) IsReady() bool {
+	// TODO once we support a ready condition, use it instead
+	return v.IsRunning()
+}
+
+func (v *VirtualMachine) IsRunning() bool {
 	return v.Status.Phase == Running || v.Status.Phase == Migrating
 }
 
+func (v *VirtualMachine) IsFinal() bool {
+	return v.Status.Phase == Failed || v.Status.Phase == Succeeded
+}
+
 // Required to satisfy Object interface
-func (vl *VMList) GetObjectKind() schema.ObjectKind {
+func (vl *VirtualMachineList) GetObjectKind() schema.ObjectKind {
 	return &vl.TypeMeta
 }
 
 // Required to satisfy ListMetaAccessor interface
-func (vl *VMList) GetListMeta() metav1.List {
+func (vl *VirtualMachineList) GetListMeta() meta.List {
 	return &vl.ListMeta
 }
 
-func (v *VM) UnmarshalJSON(data []byte) error {
-	type VMCopy VM
+func (v *VirtualMachine) UnmarshalJSON(data []byte) error {
+	type VMCopy VirtualMachine
 	tmp := VMCopy{}
 	err := json.Unmarshal(data, &tmp)
 	if err != nil {
 		return err
 	}
-	tmp2 := VM(tmp)
+	tmp2 := VirtualMachine(tmp)
 	*v = tmp2
 	return nil
 }
 
-func (vl *VMList) UnmarshalJSON(data []byte) error {
-	type VMListCopy VMList
+func (vl *VirtualMachineList) UnmarshalJSON(data []byte) error {
+	type VMListCopy VirtualMachineList
 	tmp := VMListCopy{}
 	err := json.Unmarshal(data, &tmp)
 	if err != nil {
 		return err
 	}
-	tmp2 := VMList(tmp)
+	tmp2 := VirtualMachineList(tmp)
 	*vl = tmp2
 	return nil
 }
 
-type VMConditionType string
+type VirtualMachineConditionType string
 
 // These are valid conditions of VMs.
 const (
-	// PodCreated means that the VM request was translated into a Pod which can be scheduled and started by
-	// Kubernetes.
-	PodCreated VMConditionType = "PodCreated"
 	// VMReady means the pod is able to service requests and should be added to the
 	// load balancing pools of all matching services.
-	VMReady VMConditionType = "Ready"
+	VirtualMachineReady VirtualMachineConditionType = "Ready"
+
+	// If there happens any error while trying to synchronize the VM with the Domain,
+	// this is reported as false.
+	VirtualMachineSynchronized VirtualMachineConditionType = "Synchronized"
 )
 
 type VMCondition struct {
-	Type               VMConditionType       `json:"type"`
-	Status             k8sv1.ConditionStatus `json:"status"`
-	LastProbeTime      metav1.Time           `json:"lastProbeTime,omitempty"`
-	LastTransitionTime metav1.Time           `json:"lastTransitionTime,omitempty"`
-	Reason             string                `json:"reason,omitempty"`
-	Message            string                `json:"message,omitempty"`
+	Type               VirtualMachineConditionType `json:"type"`
+	Status             k8sv1.ConditionStatus       `json:"status"`
+	LastProbeTime      metav1.Time                 `json:"lastProbeTime,omitempty"`
+	LastTransitionTime metav1.Time                 `json:"lastTransitionTime,omitempty"`
+	Reason             string                      `json:"reason,omitempty"`
+	Message            string                      `json:"message,omitempty"`
 }
 
 // VMPhase is a label for the condition of a VM at the current time.
@@ -223,8 +295,8 @@ type VMPhase string
 const (
 	//When a VM Object is first initialized and no phase, or Pending is present.
 	VmPhaseUnset VMPhase = ""
-	Pending      VMPhase = "Pending"
-	// VMPending means the VM has been accepted by the system.
+	// Pending means the VM has been accepted by the system.
+	Pending VMPhase = "Pending"
 	// Either a target pod does not yet exist or a target Pod exists but is not yet scheduled and in running state.
 	Scheduling VMPhase = "Scheduling"
 	// A target pod was scheduled and the system saw that Pod in runnig state.
@@ -254,8 +326,8 @@ const (
 	MigrationLabel    string = "kubevirt.io/migration"
 )
 
-func NewVM(name string, uid types.UID) *VM {
-	return &VM{
+func NewVM(name string, uid types.UID) *VirtualMachine {
+	return &VirtualMachine{
 		Spec: VMSpec{},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -265,9 +337,21 @@ func NewVM(name string, uid types.UID) *VM {
 		Status: VMStatus{},
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: GroupVersion.String(),
-			Kind:       VMGroupVersionKind.Kind,
+			Kind:       VirtualMachineGroupVersionKind.Kind,
 		},
 	}
+}
+
+type MigrationEvent string
+
+const (
+	StartedVirtualMachineMigration   MigrationEvent = "MigrationStarted"
+	SucceededVirtualMachineMigration MigrationEvent = "MigrationSucceeded"
+	FailedVirtualMachineMigration    MigrationEvent = "MigrationFailed"
+)
+
+func (s MigrationEvent) String() string {
+	return string(s)
 }
 
 type SyncEvent string
@@ -285,32 +369,32 @@ func (s SyncEvent) String() string {
 	return string(s)
 }
 
-func NewMinimalVM(vmName string) *VM {
+func NewMinimalVM(vmName string) *VirtualMachine {
 	return NewMinimalVMWithNS(k8sv1.NamespaceDefault, vmName)
 }
 
-func NewMinimalVMWithNS(namespace string, vmName string) *VM {
+func NewMinimalVMWithNS(namespace string, vmName string) *VirtualMachine {
 	precond.CheckNotEmpty(vmName)
 	vm := NewVMReferenceFromNameWithNS(namespace, vmName)
 	vm.Spec = VMSpec{Domain: NewMinimalDomainSpec()}
 	vm.TypeMeta = metav1.TypeMeta{
 		APIVersion: GroupVersion.String(),
-		Kind:       "VM",
+		Kind:       "VirtualMachine",
 	}
 	return vm
 }
 
 // TODO Namespace could be different, also store it somewhere in the domain, so that we can report deletes on handler startup properly
-func NewVMReferenceFromName(name string) *VM {
+func NewVMReferenceFromName(name string) *VirtualMachine {
 	return NewVMReferenceFromNameWithNS(k8sv1.NamespaceDefault, name)
 }
 
-func NewVMReferenceFromNameWithNS(namespace string, name string) *VM {
-	vm := &VM{
+func NewVMReferenceFromNameWithNS(namespace string, name string) *VirtualMachine {
+	vm := &VirtualMachine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
-			SelfLink:  fmt.Sprintf("/apis/%s/namespaces/%s/vms/%s", GroupVersion.String(), namespace, name),
+			SelfLink:  fmt.Sprintf("/apis/%s/namespaces/%s/virtualmachines/%s", GroupVersion.String(), namespace, name),
 		},
 	}
 	vm.SetGroupVersionKind(schema.GroupVersionKind{Group: GroupVersion.Group, Kind: "VM", Version: GroupVersion.Version})
@@ -321,6 +405,31 @@ type Spice struct {
 	metav1.TypeMeta `json:",inline" ini:"-"`
 	ObjectMeta      metav1.ObjectMeta `json:"metadata,omitempty" ini:"-"`
 	Info            SpiceInfo         `json:"info,omitempty" valid:"required" ini:"virt-viewer"`
+}
+
+func (in *Spice) DeepCopyInto(out *Spice) {
+	err := model.Copy(out, in)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func (in *Spice) DeepCopy() *Spice {
+	if in == nil {
+		return nil
+	}
+	out := new(Spice)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *Spice) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	} else {
+		return nil
+	}
 }
 
 type SpiceInfo struct {
@@ -381,6 +490,31 @@ type Migration struct {
 	ObjectMeta      metav1.ObjectMeta `json:"metadata,omitempty"`
 	Spec            MigrationSpec     `json:"spec,omitempty" valid:"required"`
 	Status          MigrationStatus   `json:"status,omitempty"`
+}
+
+func (in *Migration) DeepCopyInto(out *Migration) {
+	err := model.Copy(out, in)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func (in *Migration) DeepCopy() *Migration {
+	if in == nil {
+		return nil
+	}
+	out := new(Migration)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *Migration) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	} else {
+		return nil
+	}
 }
 
 // MigrationSpec is a description of a VM Migration
@@ -460,13 +594,38 @@ type MigrationList struct {
 	Items           []Migration     `json:"items"`
 }
 
+func (in *MigrationList) DeepCopyInto(out *MigrationList) {
+	err := model.Copy(out, in)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func (in *MigrationList) DeepCopy() *MigrationList {
+	if in == nil {
+		return nil
+	}
+	out := new(MigrationList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *MigrationList) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	} else {
+		return nil
+	}
+}
+
 // Required to satisfy Object interface
 func (ml *MigrationList) GetObjectKind() schema.ObjectKind {
 	return &ml.TypeMeta
 }
 
 // Required to satisfy ListMetaAccessor interface
-func (ml *MigrationList) GetListMeta() metav1.List {
+func (ml *MigrationList) GetListMeta() meta.List {
 	return &ml.ListMeta
 }
 
@@ -489,21 +648,218 @@ type MigrationHostInfo struct {
 	PidNS      string   `json:"pidns"`
 }
 
+// Given a VM, update all NodeSelectorTerms with anti-affinity for that VM's node.
+// This is useful for the case when a migration away from a node must occur.
+// This method returns the full Affinity structure updated the anti affinity terms
+func UpdateAntiAffinityFromVMNode(pod *k8sv1.Pod, vm *VirtualMachine) *k8sv1.Affinity {
+	if pod.Spec.Affinity == nil {
+		pod.Spec.Affinity = &k8sv1.Affinity{}
+	}
+
+	if pod.Spec.Affinity.NodeAffinity == nil {
+		pod.Spec.Affinity.NodeAffinity = &k8sv1.NodeAffinity{}
+	}
+
+	if pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &k8sv1.NodeSelector{}
+	}
+
+	selector := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	terms := selector.NodeSelectorTerms
+
+	if len(terms) == 0 {
+		selector.NodeSelectorTerms = append(terms, k8sv1.NodeSelectorTerm{})
+		terms = selector.NodeSelectorTerms
+	}
+
+	for idx, term := range terms {
+		if term.MatchExpressions == nil {
+			term.MatchExpressions = []k8sv1.NodeSelectorRequirement{}
+		}
+
+		term.MatchExpressions = append(term.MatchExpressions, PrepareVMNodeAntiAffinitySelectorRequirement(vm))
+		selector.NodeSelectorTerms[idx] = term
+	}
+
+	return pod.Spec.Affinity
+}
+
 // Given a VM, create a NodeSelectorTerm with anti-affinity for that VM's node.
 // This is useful for the case when a migration away from a node must occur.
-func AntiAffinityFromVMNode(vm *VM) *k8sv1.Affinity {
-	selector := k8sv1.NodeSelectorTerm{
-		MatchExpressions: []k8sv1.NodeSelectorRequirement{
-			{
-				Key:      "kubernetes.io/hostname",
-				Operator: k8sv1.NodeSelectorOpNotIn,
-				Values:   []string{vm.Status.NodeName},
-			},
-		},
+func PrepareVMNodeAntiAffinitySelectorRequirement(vm *VirtualMachine) k8sv1.NodeSelectorRequirement {
+	return k8sv1.NodeSelectorRequirement{
+		Key:      "kubernetes.io/hostname",
+		Operator: k8sv1.NodeSelectorOpNotIn,
+		Values:   []string{vm.Status.NodeName},
 	}
-	return &k8sv1.Affinity{
-		NodeAffinity: &k8sv1.NodeAffinity{
-			RequiredDuringSchedulingIgnoredDuringExecution: &k8sv1.NodeSelector{NodeSelectorTerms: []k8sv1.NodeSelectorTerm{selector}},
-		},
+}
+
+// VM is *the* VM Definition. It represents a virtual machine in the runtime environment of kubernetes.
+type VirtualMachineReplicaSet struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	// VM Spec contains the VM specification.
+	Spec VMReplicaSetSpec `json:"spec,omitempty" valid:"required"`
+	// Status is the high level overview of how the VM is doing. It contains information available to controllers and users.
+	Status VMReplicaSetStatus `json:"status,omitempty"`
+}
+
+// VMList is a list of VMs
+type VirtualMachineReplicaSetList struct {
+	metav1.TypeMeta `json:",inline"`
+	ListMeta        metav1.ListMeta            `json:"metadata,omitempty"`
+	Items           []VirtualMachineReplicaSet `json:"items"`
+}
+
+type VMReplicaSetSpec struct {
+	// Number of desired pods. This is a pointer to distinguish between explicit
+	// zero and not specified. Defaults to 1.
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// Label selector for pods. Existing ReplicaSets whose pods are
+	// selected by this will be the ones affected by this deployment.
+	// +optional
+	Selector *metav1.LabelSelector `json:"selector,omitempty" valid:"required"`
+
+	// Template describes the pods that will be created.
+	Template *VMTemplateSpec `json:"template" valid:"required"`
+
+	// Indicates that the replica set is paused.
+	// +optional
+	Paused bool `json:"paused,omitempty" protobuf:"varint,7,opt,name=paused"`
+}
+
+type VMReplicaSetStatus struct {
+	// Total number of non-terminated pods targeted by this deployment (their labels match the selector).
+	// +optional
+	Replicas int32 `json:"replicas,omitempty" protobuf:"varint,2,opt,name=replicas"`
+
+	// The number of ready replicas for this replica set.
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty" protobuf:"varint,4,opt,name=readyReplicas"`
+
+	Conditions []VMReplicaSetCondition `json:"conditions" optional:"true"`
+}
+
+type VMReplicaSetCondition struct {
+	Type               VMReplicaSetConditionType `json:"type"`
+	Status             k8sv1.ConditionStatus     `json:"status"`
+	LastProbeTime      metav1.Time               `json:"lastProbeTime,omitempty"`
+	LastTransitionTime metav1.Time               `json:"lastTransitionTime,omitempty"`
+	Reason             string                    `json:"reason,omitempty"`
+	Message            string                    `json:"message,omitempty"`
+}
+
+type VMReplicaSetConditionType string
+
+const (
+	// VMReplicaSetReplicaFailure is added in a replica set when one of its vms
+	// fails to be created due to insufficient quota, limit ranges, pod security policy, node selectors,
+	// etc. or deleted due to kubelet being down or finalizers are failing.
+	VMReplicaSetReplicaFailure VMReplicaSetConditionType = "ReplicaFailure"
+
+	// VMReplicaSetReplicaPaused is added in a replica set when the replica set got paused by the controller.
+	// After this condition was added, it is safe to remove or add vms by hand and adjust the replica count by hand.
+	VMReplicaSetReplicaPaused VMReplicaSetConditionType = "ReplicaPaused"
+)
+
+type VMTemplateSpec struct {
+	ObjectMeta metav1.ObjectMeta `json:"metadata,omitempty"`
+	// VM Spec contains the VM specification.
+	Spec VMSpec `json:"spec,omitempty" valid:"required"`
+}
+
+// Required to satisfy Object interface
+func (v *VirtualMachineReplicaSet) GetObjectKind() schema.ObjectKind {
+	return &v.TypeMeta
+}
+
+// Required to satisfy ObjectMetaAccessor interface
+func (v *VirtualMachineReplicaSet) GetObjectMeta() metav1.Object {
+	return &v.ObjectMeta
+}
+
+func (v *VirtualMachineReplicaSet) UnmarshalJSON(data []byte) error {
+	type VMReplicaSetCopy VirtualMachineReplicaSet
+	tmp := VMReplicaSetCopy{}
+	err := json.Unmarshal(data, &tmp)
+	if err != nil {
+		return err
+	}
+	tmp2 := VirtualMachineReplicaSet(tmp)
+	*v = tmp2
+	return nil
+}
+
+func (vl *VirtualMachineReplicaSetList) UnmarshalJSON(data []byte) error {
+	type VMReplicaSetListCopy VirtualMachineReplicaSetList
+	tmp := VMReplicaSetListCopy{}
+	err := json.Unmarshal(data, &tmp)
+	if err != nil {
+		return err
+	}
+	tmp2 := VirtualMachineReplicaSetList(tmp)
+	*vl = tmp2
+	return nil
+}
+
+// Required to satisfy Object interface
+func (vl *VirtualMachineReplicaSetList) GetObjectKind() schema.ObjectKind {
+	return &vl.TypeMeta
+}
+
+// Required to satisfy ListMetaAccessor interface
+func (vl *VirtualMachineReplicaSetList) GetListMeta() meta.List {
+	return &vl.ListMeta
+}
+
+func (in *VirtualMachineReplicaSet) DeepCopyInto(out *VirtualMachineReplicaSet) {
+	err := model.Copy(out, in)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func (in *VirtualMachineReplicaSet) DeepCopy() *VirtualMachineReplicaSet {
+	if in == nil {
+		return nil
+	}
+	out := new(VirtualMachineReplicaSet)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *VirtualMachineReplicaSet) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	} else {
+		return nil
+	}
+}
+
+func (in *VirtualMachineReplicaSetList) DeepCopyInto(out *VirtualMachineReplicaSetList) {
+	err := model.Copy(out, in)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func (in *VirtualMachineReplicaSetList) DeepCopy() *VirtualMachineReplicaSetList {
+	if in == nil {
+		return nil
+	}
+	out := new(VirtualMachineReplicaSetList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *VirtualMachineReplicaSetList) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	} else {
+		return nil
 	}
 }

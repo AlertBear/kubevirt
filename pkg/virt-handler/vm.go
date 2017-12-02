@@ -23,6 +23,7 @@ import (
 	goerror "errors"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"time"
 
@@ -30,66 +31,92 @@ import (
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
+	"k8s.io/apimachinery/pkg/util/wait"
+
 	"kubevirt.io/kubevirt/pkg/api/v1"
 	cloudinit "kubevirt.io/kubevirt/pkg/cloud-init"
 	configdisk "kubevirt.io/kubevirt/pkg/config-disk"
+	"kubevirt.io/kubevirt/pkg/controller"
 	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/log"
 	registrydisk "kubevirt.io/kubevirt/pkg/registry-disk"
 	"kubevirt.io/kubevirt/pkg/virt-handler/virtwrap"
 	"kubevirt.io/kubevirt/pkg/virt-handler/virtwrap/api"
+	watchdog "kubevirt.io/kubevirt/pkg/watchdog"
 )
 
-func NewVMController(lw cache.ListerWatcher,
+func NewController(
 	domainManager virtwrap.DomainManager,
 	recorder record.EventRecorder,
-	restClient rest.RESTClient,
 	clientset kubecli.KubevirtClient,
 	host string,
-	configDiskClient configdisk.ConfigDiskClient) (cache.Store, workqueue.RateLimitingInterface, *kubecli.Controller) {
+	configDiskClient configdisk.ConfigDiskClient,
+	virtShareDir string,
+	watchdogTimeoutSeconds int,
+	vmInformer cache.SharedIndexInformer,
+	domainInformer cache.SharedInformer,
+	watchdogInformer cache.SharedIndexInformer,
+) *VirtualMachineController {
+
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	dispatch := NewVMHandlerDispatch(domainManager, recorder, &restClient, clientset, host, configDiskClient)
-
-	indexer, informer := kubecli.NewController(lw, queue, &v1.VM{}, dispatch)
-	return indexer, queue, informer
-
-}
-func NewVMHandlerDispatch(domainManager virtwrap.DomainManager,
-	recorder record.EventRecorder,
-	restClient *rest.RESTClient,
-	clientset kubecli.KubevirtClient,
-	host string,
-	configDiskClient configdisk.ConfigDiskClient) kubecli.ControllerDispatch {
-	return &VMHandlerDispatch{
-		domainManager: domainManager,
-		recorder:      recorder,
-		restClient:    *restClient,
-		clientset:     clientset,
-		host:          host,
-		configDisk:    configDiskClient,
+	c := &VirtualMachineController{
+		Queue:                  queue,
+		domainManager:          domainManager,
+		recorder:               recorder,
+		clientset:              clientset,
+		host:                   host,
+		configDisk:             configDiskClient,
+		virtShareDir:           virtShareDir,
+		watchdogTimeoutSeconds: watchdogTimeoutSeconds,
+		vmInformer:             vmInformer,
+		domainInformer:         domainInformer,
+		watchdogInformer:       watchdogInformer,
 	}
+
+	vmInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addFunc,
+		DeleteFunc: c.deleteFunc,
+		UpdateFunc: c.updateFunc,
+	})
+
+	domainInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addDomainFunc,
+		DeleteFunc: c.deleteDomainFunc,
+		UpdateFunc: c.updateDomainFunc,
+	})
+
+	watchdogInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addFunc,
+		DeleteFunc: c.deleteFunc,
+		UpdateFunc: c.updateFunc,
+	})
+
+	return c
 }
 
-type VMHandlerDispatch struct {
-	domainManager virtwrap.DomainManager
-	recorder      record.EventRecorder
-	restClient    rest.RESTClient
-	clientset     kubecli.KubevirtClient
-	host          string
-	configDisk    configdisk.ConfigDiskClient
+type VirtualMachineController struct {
+	domainManager          virtwrap.DomainManager
+	recorder               record.EventRecorder
+	clientset              kubecli.KubevirtClient
+	host                   string
+	configDisk             configdisk.ConfigDiskClient
+	virtShareDir           string
+	watchdogTimeoutSeconds int
+	Queue                  workqueue.RateLimitingInterface
+	vmInformer             cache.SharedIndexInformer
+	domainInformer         cache.SharedInformer
+	watchdogInformer       cache.SharedIndexInformer
 }
 
-func (d *VMHandlerDispatch) getVMNodeAddress(vm *v1.VM) (string, error) {
+func (d *VirtualMachineController) getVMNodeAddress(vm *v1.VirtualMachine) (string, error) {
 	node, err := d.clientset.CoreV1().Nodes().Get(vm.Status.NodeName, metav1.GetOptions{})
 	if err != nil {
-		logging.DefaultLogger().Error().Reason(err).Msgf("fetching source node %s failed", vm.Status.NodeName)
+		log.Log.Reason(err).Errorf("fetching source node %s failed", vm.Status.NodeName)
 		return "", err
 	}
 
@@ -102,77 +129,188 @@ func (d *VMHandlerDispatch) getVMNodeAddress(vm *v1.VM) (string, error) {
 	}
 	if addrStr == "" {
 		err := fmt.Errorf("VM node is unreachable")
-		logging.DefaultLogger().Error().Msg("VM node is unreachable")
+		log.Log.Error("VM node is unreachable")
 		return "", err
 	}
 
 	return addrStr, nil
 }
 
-func (d *VMHandlerDispatch) updateVMStatus(vm *v1.VM, cfg *api.DomainSpec) error {
-	obj, err := scheme.Scheme.Copy(vm)
-	if err != nil {
-		return err
-	}
-	vm = obj.(*v1.VM)
+func (d *VirtualMachineController) updateVMStatus(vm *v1.VirtualMachine, domain *api.Domain, syncError error) (err error) {
 
-	// XXX When we start supporting hotplug, this needs to be altered.
-	// Check if the VM is already marked as running. If yes, don't update the VM.
-	// Otherwise we end up in endless controller requeues.
-	if vm.Status.Phase == v1.Running {
+	// Don't update the VM if it is already in a final state
+	if vm.IsFinal() {
 		return nil
 	}
 
-	vm.Status.Phase = v1.Running
+	// While the VM is migrating, don't do anything, the Migration Controller is in charge
+	if vm.Status.MigrationNodeName != "" {
+		return nil
+	}
+
+	oldStatus := vm.DeepCopy().Status
+	// Make sure that we always deal with an empty instance for later equality checks
+	if oldStatus.Graphics == nil {
+		oldStatus.Graphics = []v1.VMGraphics{}
+	}
+
+	// Calculate the new VM state based on what libvirt reported
+	d.setVmPhaseForStatusReason(domain, vm)
 
 	vm.Status.Graphics = []v1.VMGraphics{}
 
-	podIP, err := d.getVMNodeAddress(vm)
+	// Update devices if device status changed
+	// TODO needs caching, better position or init fetch
+	if domain != nil {
+		nodeIP, err := d.getVMNodeAddress(vm)
+		if err != nil {
+			return err
+		}
+
+		vm.Status.Graphics = []v1.VMGraphics{}
+		for _, src := range domain.Spec.Devices.Graphics {
+			if (src.Type != "spice" && src.Type != "vnc") || src.Port == -1 {
+				continue
+			}
+			dst := v1.VMGraphics{
+				Type: src.Type,
+				Host: nodeIP,
+				Port: src.Port,
+			}
+			vm.Status.Graphics = append(vm.Status.Graphics, dst)
+		}
+	}
+
+	d.checkFailure(vm, syncError, "Synchronizing with the Domain failed.")
+
+	if !reflect.DeepEqual(oldStatus, vm.Status) {
+		_, err = d.clientset.VM(vm.ObjectMeta.Namespace).Update(vm)
+		if err != nil {
+			return err
+		}
+	}
+
+	if oldStatus.Phase != vm.Status.Phase {
+		switch vm.Status.Phase {
+		case v1.Succeeded:
+			d.recorder.Event(vm, k8sv1.EventTypeNormal, v1.Stopped.String(), "The VM was shut down.")
+		case v1.Failed:
+			d.recorder.Event(vm, k8sv1.EventTypeWarning, v1.Stopped.String(), "The VM crashed.")
+		}
+	}
+
+	return nil
+}
+
+func (c *VirtualMachineController) Run(threadiness int, stopCh chan struct{}) {
+	defer c.Queue.ShutDown()
+	log.Log.Info("Starting virt-handler controller.")
+
+	// Wait for the domain cache to be synced
+	go c.domainInformer.Run(stopCh)
+	cache.WaitForCacheSync(stopCh, c.domainInformer.HasSynced)
+
+	// Poplulate the VM store with known Domains on the host, to get deletes since the last run
+	for _, domain := range c.domainInformer.GetStore().List() {
+		d := domain.(*api.Domain)
+		c.vmInformer.GetStore().Add(v1.NewVMReferenceFromNameWithNS(d.ObjectMeta.Namespace, d.ObjectMeta.Name))
+	}
+
+	// Clean up left over config disks
+	err := c.configDisk.UndefineUnseen(c.vmInformer.GetStore())
+	if err != nil {
+		panic(err)
+	}
+
+	// Clean up left over registry disks
+	err = registrydisk.CleanupOrphanedEphemeralDisks(c.vmInformer.GetStore())
+	if err != nil {
+		panic(err)
+	}
+
+	go c.vmInformer.Run(stopCh)
+	go c.watchdogInformer.Run(stopCh)
+	cache.WaitForCacheSync(stopCh, c.domainInformer.HasSynced, c.vmInformer.HasSynced, c.watchdogInformer.HasSynced)
+
+	// Start the actual work
+	for i := 0; i < threadiness; i++ {
+		go wait.Until(c.runWorker, time.Second, stopCh)
+	}
+
+	<-stopCh
+	log.Log.Info("Stopping virt-handler controller.")
+}
+
+func (c *VirtualMachineController) runWorker() {
+	for c.Execute() {
+	}
+}
+
+func (c *VirtualMachineController) Execute() bool {
+	key, quit := c.Queue.Get()
+	if quit {
+		return false
+	}
+	defer c.Queue.Done(key)
+	if err := c.execute(key.(string)); err != nil {
+		log.Log.Reason(err).Infof("re-enqueuing VirtualMachineReplicaSet %v", key)
+		c.Queue.AddRateLimited(key)
+	} else {
+		log.Log.V(4).Infof("processed VirtualMachineReplicaSet %v", key)
+		c.Queue.Forget(key)
+	}
+	return true
+}
+
+func (d *VirtualMachineController) getVMFromCache(key string) (vm *v1.VirtualMachine, exists bool, err error) {
+
+	// Fetch the latest Vm state from cache
+	obj, exists, err := d.vmInformer.GetStore().GetByKey(key)
+
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Retrieve the VM
+	if !exists {
+		namespace, name, err := cache.SplitMetaNamespaceKey(key)
+		if err != nil {
+			// TODO log and don't retry
+			return nil, false, err
+		}
+		vm = v1.NewVMReferenceFromNameWithNS(namespace, name)
+	} else {
+		vm = obj.(*v1.VirtualMachine)
+	}
+	return vm, exists, nil
+}
+
+func (d *VirtualMachineController) getDomainFromCache(key string) (domain *api.Domain, err error) {
+
+	obj, exists, err := d.domainInformer.GetStore().GetByKey(key)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if exists {
+		domain = obj.(*api.Domain)
+	}
+	return domain, nil
+}
+
+func (d *VirtualMachineController) execute(key string) error {
+
+	shouldDeleteVm := false
+
+	vm, exists, err := d.getVMFromCache(key)
 	if err != nil {
 		return err
 	}
 
-	for _, src := range cfg.Devices.Graphics {
-		if (src.Type != "spice" && src.Type != "vnc") || src.Port == -1 {
-			continue
-		}
-		dst := v1.VMGraphics{
-			Type: src.Type,
-			Host: podIP,
-			Port: src.Port,
-		}
-		vm.Status.Graphics = append(vm.Status.Graphics, dst)
-	}
-
-	return d.restClient.Put().Resource("vms").Body(vm).
-		Name(vm.ObjectMeta.Name).Namespace(vm.ObjectMeta.Namespace).Do().Error()
-
-}
-
-func (d *VMHandlerDispatch) Execute(store cache.Store, queue workqueue.RateLimitingInterface, key interface{}) {
-
-	shouldDeleteVm := false
-
-	// Fetch the latest Vm state from cache
-	obj, exists, err := store.GetByKey(key.(string))
-
+	domain, err := d.getDomainFromCache(key)
 	if err != nil {
-		queue.AddRateLimited(key)
-		return
-	}
-
-	// Retrieve the VM
-	var vm *v1.VM
-	if !exists {
-		namespace, name, err := cache.SplitMetaNamespaceKey(key.(string))
-		if err != nil {
-			// TODO do something more smart here
-			queue.AddRateLimited(key)
-			return
-		}
-		vm = v1.NewVMReferenceFromNameWithNS(namespace, name)
-	} else {
-		vm = obj.(*v1.VM)
+		return err
 	}
 
 	// Check For Migration before processing vm not in our cache
@@ -181,82 +319,97 @@ func (d *VMHandlerDispatch) Execute(store cache.Store, queue workqueue.RateLimit
 		isDestination, err := d.isMigrationDestination(vm.GetObjectMeta().GetNamespace(), vm.GetObjectMeta().GetName())
 		if err != nil {
 			// unable to determine migration status, we'll try again later.
-			queue.AddRateLimited(key)
-			return
+			return err
 		}
 
 		if isDestination {
 			// OK, this VM is migrating to us, don't interrupt it.
-			queue.Forget(key)
-			return
+			return nil
 		}
 		// The VM is deleted on the cluster, continue with processing the deletion on the host.
 		shouldDeleteVm = true
 	}
-	logging.DefaultLogger().V(3).Info().Object(vm).Msg("Processing VM update.")
 
-	// Process the VM
-	isPending, err := d.processVmUpdate(vm, shouldDeleteVm)
-	if err != nil {
-		// Something went wrong, reenqueue the item with a delay
-		logging.DefaultLogger().Error().Object(vm).Reason(err).Msg("Synchronizing the VM failed.")
-		d.recorder.Event(vm, k8sv1.EventTypeWarning, v1.SyncFailed.String(), err.Error())
-		queue.AddRateLimited(key)
-		return
-	} else if isPending {
-		// waiting on an async action to complete
-		logging.DefaultLogger().V(3).Info().Object(vm).Reason(err).Msg("Synchronizing is in a pending state.")
-		queue.AddAfter(key, 1*time.Second)
-		queue.Forget(key)
-		return
+	watchdogExpired, _ := watchdog.WatchdogFileIsExpired(d.watchdogTimeoutSeconds, d.virtShareDir, vm)
+	if watchdogExpired {
+		if vm.IsRunning() {
+			log.Log.V(2).Object(vm).Info("Detected expired watchdog file for running VM.")
+			shouldDeleteVm = true
+		} else if vm.IsFinal() {
+			err = watchdog.WatchdogFileRemove(d.virtShareDir, vm)
+			if err != nil {
+				return nil
+			}
+		}
 	}
 
-	logging.DefaultLogger().V(3).Info().Object(vm).Msg("Synchronizing the VM succeeded.")
-	queue.Forget(key)
-	return
+	log.Log.Object(vm).V(3).Info("Processing VM update.")
+
+	// Process the VM only if the current phases are in sync
+	var syncErr error
+	if vm.Status.Phase == d.calculateVmPhaseForStatusReason(domain, vm) || !exists {
+		syncErr = d.processVmUpdate(vm.DeepCopy(), shouldDeleteVm)
+		if syncErr != nil {
+			d.recorder.Event(vm, k8sv1.EventTypeWarning, v1.SyncFailed.String(), syncErr.Error())
+			log.Log.Object(vm).Reason(syncErr).Error("Synchronizing the VM failed.")
+		}
+	}
+
+	// Update the VM status, if the VM exists
+	if exists {
+		err = d.updateVMStatus(vm.DeepCopy(), domain, syncErr)
+		if err != nil {
+			log.Log.Object(vm).Reason(err).Error("Updating the VM status failed.")
+			return err
+		}
+	}
+
+	if syncErr != nil {
+		return syncErr
+	}
+
+	log.Log.Object(vm).V(3).Info("Synchronization loop succeeded.")
+	return nil
 }
 
 // Almost everything in the VM object maps exactly to its domain counterpart
 // One exception is persistent volume claims. This function looks up each PV
 // and inserts a corrected disk entry into the VM's device map.
-func MapPersistentVolumes(vm *v1.VM, restClient cache.Getter, namespace string) (*v1.VM, error) {
-	vmCopy := &v1.VM{}
+func MapPersistentVolumes(vm *v1.VirtualMachine, clientset kubecli.KubevirtClient, namespace string) (*v1.VirtualMachine, error) {
+	vmCopy := &v1.VirtualMachine{}
 	model.Copy(vmCopy, vm)
-	logger := logging.DefaultLogger().Object(vm)
+	logger := log.Log.Object(vm)
 
 	for idx, disk := range vmCopy.Spec.Domain.Devices.Disks {
 		if disk.Type == "PersistentVolumeClaim" {
-			logger.V(3).Info().Msgf("Mapping PersistentVolumeClaim: %s", disk.Source.Name)
+			logger.V(3).Infof("Mapping PersistentVolumeClaim: %s", disk.Source.Name)
 
 			// Look up existing persistent volume
-			obj, err := restClient.Get().Namespace(namespace).Resource("persistentvolumeclaims").Name(disk.Source.Name).Do().Get()
+			pvc, err := clientset.CoreV1().PersistentVolumeClaims(namespace).Get(disk.Source.Name, metav1.GetOptions{})
 
 			if err != nil {
-				logger.Error().Reason(err).Msg("unable to look up persistent volume claim")
+				logger.Reason(err).Error("unable to look up persistent volume claim")
 				return vm, fmt.Errorf("unable to look up persistent volume claim: %v", err)
 			}
 
-			pvc := obj.(*k8sv1.PersistentVolumeClaim)
 			if pvc.Status.Phase != k8sv1.ClaimBound {
-				logger.Error().Msg("attempted use of unbound persistent volume")
+				logger.Error("attempted use of unbound persistent volume")
 				return vm, fmt.Errorf("attempted use of unbound persistent volume claim: %s", pvc.Name)
 			}
 
 			// Look up the PersistentVolume this PVC is bound to
-			// Note: This call is not namespaced!
-			obj, err = restClient.Get().Resource("persistentvolumes").Name(pvc.Spec.VolumeName).Do().Get()
+			pv, err := clientset.CoreV1().PersistentVolumes().Get(pvc.Spec.VolumeName, metav1.GetOptions{})
 
 			if err != nil {
-				logger.Error().Reason(err).Msg("unable to access persistent volume record")
+				logger.Reason(err).Error("unable to access persistent volume record")
 				return vm, fmt.Errorf("unable to access persistent volume record: %v", err)
 			}
-			pv := obj.(*k8sv1.PersistentVolume)
 
-			logger.Info().Msgf("Mapping PVC %s", pv.Name)
+			logger.Infof("Mapping PVC %s", pv.Name)
 			newDisk, err := mapPVToDisk(&disk, pv)
 
 			if err != nil {
-				logger.Error().Reason(err).Msgf("Mapping PVC %s failed", pv.Name)
+				logger.Reason(err).Errorf("Mapping PVC %s failed", pv.Name)
 				return vm, err
 			}
 
@@ -266,13 +419,13 @@ func MapPersistentVolumes(vm *v1.VM, restClient cache.Getter, namespace string) 
 			model.Copy(&newDisk, disk)
 
 			if disk.Source.Host == nil {
-				logger.Error().Msg("Missing disk source host")
+				logger.Error("Missing disk source host")
 				return vm, fmt.Errorf("Missing disk source host")
 			}
 
 			ipAddrs, err := net.LookupIP(disk.Source.Host.Name)
 			if err != nil || ipAddrs == nil || len(ipAddrs) < 1 {
-				logger.Error().Reason(err).Msgf("Unable to resolve host '%s'", disk.Source.Host.Name)
+				logger.Reason(err).Errorf("Unable to resolve host '%s'", disk.Source.Host.Name)
 				return vm, fmt.Errorf("Unable to resolve host '%s': %s", disk.Source.Host.Name, err)
 			}
 
@@ -327,7 +480,7 @@ func mapPVToDisk(disk *v1.Disk, pv *k8sv1.PersistentVolume) (*v1.Disk, error) {
 	}
 }
 
-func (d *VMHandlerDispatch) injectDiskAuth(vm *v1.VM) (*v1.VM, error) {
+func (d *VirtualMachineController) injectDiskAuth(vm *v1.VirtualMachine) (*v1.VirtualMachine, error) {
 	for idx, disk := range vm.Spec.Domain.Devices.Disks {
 		if disk.Auth == nil || disk.Auth.Secret == nil || disk.Auth.Secret.Usage == "" {
 			continue
@@ -346,7 +499,7 @@ func (d *VMHandlerDispatch) injectDiskAuth(vm *v1.VM) (*v1.VM, error) {
 
 		secret, err := d.clientset.CoreV1().Secrets(vm.ObjectMeta.Namespace).Get(secretID, metav1.GetOptions{})
 		if err != nil {
-			logging.DefaultLogger().Error().Reason(err).Msg("Defining the VM secret failed unable to pull corresponding k8s secret value")
+			log.Log.Reason(err).Error("Defining the VM secret failed unable to pull corresponding k8s secret value")
 			return nil, err
 		}
 
@@ -376,52 +529,79 @@ func (d *VMHandlerDispatch) injectDiskAuth(vm *v1.VM) (*v1.VM, error) {
 	return vm, nil
 }
 
-func (d *VMHandlerDispatch) processVmUpdate(vm *v1.VM, shouldDeleteVm bool) (bool, error) {
+func (d *VirtualMachineController) processVmUpdate(vm *v1.VirtualMachine, shouldDeleteVM bool) error {
 
-	if shouldDeleteVm {
+	if shouldDeleteVM || vm.ObjectMeta.DeletionTimestamp != nil || vm.IsFinal() {
 		// Since the VM was not in the cache, we delete it
 		err := d.domainManager.KillVM(vm)
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		// remove any defined libvirt secrets associated with this vm
 		err = d.domainManager.RemoveVMSecrets(vm)
 		if err != nil {
-			return false, err
+			return err
 		}
-		return false, d.configDisk.Undefine(vm)
+
+		err = registrydisk.CleanupEphemeralDisks(vm)
+		if err != nil {
+			return err
+		}
+
+		err = watchdog.WatchdogFileRemove(d.virtShareDir, vm)
+		if err != nil {
+			return err
+		}
+
+		return d.configDisk.Undefine(vm)
 	} else if isWorthSyncing(vm) == false {
 		// nothing to do here.
-		return false, nil
+		return nil
+	}
+
+	hasWatchdog, err := watchdog.WatchdogFileExists(d.virtShareDir, vm)
+	if err != nil {
+		log.Log.Object(vm).Reason(err).V(3).Error("Error accessing virt-launcher watchdog file.")
+		return err
+	}
+	if hasWatchdog == false {
+		log.Log.Object(vm).Reason(err).V(3).Error("Could not detect virt-launcher watchdog file.")
+		return goerror.New(fmt.Sprintf("No watchdog file found for vm"))
 	}
 
 	isPending, err := d.configDisk.Define(vm)
-	if err != nil || isPending == true {
-		return isPending, err
+	if err != nil {
+		return err
+	}
+
+	if isPending {
+		log.Log.Object(vm).V(3).Info("Synchronizing is in a pending state.")
+		d.Queue.AddAfter(controller.VirtualMachineKey(vm), 1*time.Second)
+		return nil
 	}
 
 	// Synchronize the VM state
-	vm, err = MapPersistentVolumes(vm, d.clientset.CoreV1().RESTClient(), vm.ObjectMeta.Namespace)
+	vm, err = MapPersistentVolumes(vm, d.clientset, vm.ObjectMeta.Namespace)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	// Map Container Registry Disks to block devices Libvirt can consume
 	vm, err = registrydisk.MapRegistryDisks(vm)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	vm, err = d.injectDiskAuth(vm)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	// Map whatever devices are being used for config-init
 	vm, err = cloudinit.MapCloudInitDisks(vm)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	// TODO MigrationNodeName should be a pointer
@@ -429,41 +609,147 @@ func (d *VMHandlerDispatch) processVmUpdate(vm *v1.VM, shouldDeleteVm bool) (boo
 		// Only sync if the VM is not marked as migrating.
 		// Everything except shutting down the VM is not
 		// permitted when it is migrating.
-		return false, nil
+		return nil
 	}
 
 	// TODO check if found VM has the same UID like the domain,
 	// if not, delete the Domain first
-	newCfg, err := d.domainManager.SyncVM(vm)
-	if err != nil {
-		return false, err
-	}
-
-	return false, d.updateVMStatus(vm, newCfg)
+	_, err = d.domainManager.SyncVM(vm)
+	return err
 }
 
-func (d *VMHandlerDispatch) isMigrationDestination(namespace string, vmName string) (bool, error) {
+func (d *VirtualMachineController) isMigrationDestination(namespace string, vmName string) (bool, error) {
 
 	// If we don't have the VM in the cache, it could be that it is currently migrating to us
-	result := d.restClient.Get().Name(vmName).Resource("vms").Namespace(namespace).Do()
-	if result.Error() == nil {
+	fetchedVM, err := d.clientset.VM(namespace).Get(vmName, metav1.GetOptions{})
+	if err == nil {
 		// So the VM still seems to exist
-		fetchedVM, err := result.Get()
-		if err != nil {
-			return false, err
-		}
-		if fetchedVM.(*v1.VM).Status.MigrationNodeName == d.host {
+
+		if fetchedVM.Status.MigrationNodeName == d.host {
 			return true, nil
 		}
-	} else if !errors.IsNotFound(result.Error()) {
+	} else if !errors.IsNotFound(err) {
 		// Something went wrong, let's try again later
-		return false, result.Error()
+		return false, err
 	}
 
 	// VM object was not found.
 	return false, nil
 }
 
-func isWorthSyncing(vm *v1.VM) bool {
-	return vm.Status.Phase != v1.Succeeded && vm.Status.Phase != v1.Failed
+func isWorthSyncing(vm *v1.VirtualMachine) bool {
+	return !vm.IsFinal()
+}
+
+func (d *VirtualMachineController) checkFailure(vm *v1.VirtualMachine, syncErr error, reason string) (changed bool) {
+	if syncErr != nil && !d.hasCondition(vm, v1.VirtualMachineSynchronized) {
+		vm.Status.Conditions = append(vm.Status.Conditions, v1.VMCondition{
+			Type:               v1.VirtualMachineSynchronized,
+			Reason:             reason,
+			Message:            syncErr.Error(),
+			LastTransitionTime: metav1.Now(),
+			Status:             k8sv1.ConditionFalse,
+		})
+		return true
+	} else if syncErr == nil && d.hasCondition(vm, v1.VirtualMachineSynchronized) {
+		d.removeCondition(vm, v1.VirtualMachineSynchronized)
+		return true
+	}
+	return false
+}
+
+func (d *VirtualMachineController) hasCondition(vm *v1.VirtualMachine, cond v1.VirtualMachineConditionType) bool {
+	for _, c := range vm.Status.Conditions {
+		if c.Type == cond {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *VirtualMachineController) removeCondition(vm *v1.VirtualMachine, cond v1.VirtualMachineConditionType) {
+	conds := []v1.VMCondition{}
+	for _, c := range vm.Status.Conditions {
+		if c.Type == cond {
+			continue
+		}
+		conds = append(conds, c)
+	}
+	vm.Status.Conditions = conds
+}
+
+func (d *VirtualMachineController) setVmPhaseForStatusReason(domain *api.Domain, vm *v1.VirtualMachine) {
+	vm.Status.Phase = d.calculateVmPhaseForStatusReason(domain, vm)
+}
+func (d *VirtualMachineController) calculateVmPhaseForStatusReason(domain *api.Domain, vm *v1.VirtualMachine) v1.VMPhase {
+
+	if domain == nil {
+		if !vm.IsRunning() {
+			return v1.Scheduled
+		} else {
+			// That is unexpected. We should not be able to delete a VM before we stop it.
+			// However, if someone directly interacts with libvirt it is possible
+			return v1.Failed
+		}
+	} else {
+		switch domain.Status.Status {
+		case api.Shutoff, api.Crashed:
+			switch domain.Status.Reason {
+			case api.ReasonCrashed, api.ReasonPanicked:
+				return v1.Failed
+			case api.ReasonShutdown, api.ReasonDestroyed, api.ReasonSaved, api.ReasonFromSnapshot:
+				return v1.Succeeded
+			}
+		case api.Running, api.Paused, api.Blocked, api.PMSuspended:
+			return v1.Running
+		}
+	}
+	return vm.Status.Phase
+}
+
+func (d *VirtualMachineController) addFunc(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err == nil {
+		d.Queue.Add(key)
+	}
+}
+func (d *VirtualMachineController) deleteFunc(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err == nil {
+		d.Queue.Add(key)
+	}
+}
+func (d *VirtualMachineController) updateFunc(old, new interface{}) {
+	key, err := controller.KeyFunc(new)
+	if err == nil {
+		d.Queue.Add(key)
+	}
+}
+
+func (d *VirtualMachineController) addDomainFunc(obj interface{}) {
+	domain := obj.(*api.Domain)
+	log.Log.Object(domain).Infof("Domain is in state %s reason %s", domain.Status.Status, domain.Status.Reason)
+	key, err := controller.KeyFunc(obj)
+	if err == nil {
+		d.Queue.Add(key)
+	}
+}
+func (d *VirtualMachineController) deleteDomainFunc(obj interface{}) {
+	domain := obj.(*api.Domain)
+	log.Log.Object(domain).Info("Domain deleted")
+	key, err := controller.KeyFunc(obj)
+	if err == nil {
+		d.Queue.Add(key)
+	}
+}
+func (d *VirtualMachineController) updateDomainFunc(old, new interface{}) {
+	newDomain := new.(*api.Domain)
+	oldDomain := old.(*api.Domain)
+	if oldDomain.Status.Status != newDomain.Status.Status || oldDomain.Status.Reason != newDomain.Status.Reason {
+		log.Log.Object(newDomain).Infof("Domain is in state %s reason %s", newDomain.Status.Status, newDomain.Status.Reason)
+	}
+	key, err := controller.KeyFunc(new)
+	if err == nil {
+		d.Queue.Add(key)
+	}
 }

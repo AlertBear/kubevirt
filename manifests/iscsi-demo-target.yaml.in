@@ -3,6 +3,7 @@ kind: PersistentVolumeClaim
 metadata:
   name: disk-custom
 spec:
+  storageClassName: ""
   accessModes:
     - ReadWriteOnce
   resources:
@@ -18,6 +19,7 @@ kind: PersistentVolumeClaim
 metadata:
   name: disk-alpine
 spec:
+  storageClassName: ""
   accessModes:
     - ReadWriteOnce
   resources:
@@ -33,6 +35,7 @@ kind: PersistentVolumeClaim
 metadata:
   name: disk-cirros
 spec:
+  storageClassName: ""
   accessModes:
     - ReadWriteOnce
   resources:
@@ -56,7 +59,7 @@ spec:
   iscsi:
     iqn: iqn.2017-01.io.kubevirt:sn.42
     lun: 1
-    targetPortal: iscsi-demo-target.default.svc.cluster.local
+    targetPortal: iscsi-demo-target.kube-system.svc.cluster.local
 ---
 apiVersion: v1
 kind: PersistentVolume
@@ -72,7 +75,7 @@ spec:
   iscsi:
     iqn: iqn.2017-01.io.kubevirt:sn.42
     lun: 2
-    targetPortal: iscsi-demo-target.default.svc.cluster.local
+    targetPortal: iscsi-demo-target.kube-system.svc.cluster.local
 ---
 apiVersion: v1
 kind: PersistentVolume
@@ -88,12 +91,13 @@ spec:
   iscsi:
     iqn: iqn.2017-01.io.kubevirt:sn.42
     lun: 3
-    targetPortal: iscsi-demo-target.default.svc.cluster.local
+    targetPortal: iscsi-demo-target.kube-system.svc.cluster.local
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: iscsi-demo-target
+  namespace: kube-system
 spec:
   ports:
     - name: iscsi
@@ -106,6 +110,7 @@ apiVersion: extensions/v1beta1
 kind: Deployment
 metadata:
   name: iscsi-demo-target-tgtd
+  namespace: kube-system
 spec:
   template:
     metadata:
@@ -130,5 +135,3 @@ spec:
         - name: host
           hostPath:
             path: /
-      nodeSelector:
-        kubernetes.io/hostname: {{ primary_node_name }}

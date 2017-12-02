@@ -33,8 +33,8 @@ import (
 )
 
 type ConfigDiskClient interface {
-	Define(vm *v1.VM) (bool, error)
-	Undefine(vm *v1.VM) error
+	Define(vm *v1.VirtualMachine) (bool, error)
+	Undefine(vm *v1.VirtualMachine) error
 	UndefineUnseen(indexer cache.Store) error
 }
 
@@ -51,13 +51,13 @@ func NewConfigDiskClient(clientset kubecli.KubevirtClient) ConfigDiskClient {
 	}
 }
 
-func createKey(vm *v1.VM) string {
+func createKey(vm *v1.VirtualMachine) string {
 	namespace := precond.MustNotBeEmpty(vm.GetObjectMeta().GetNamespace())
 	domain := precond.MustNotBeEmpty(vm.GetObjectMeta().GetName())
 	return fmt.Sprintf("%s/%s", namespace, domain)
 }
 
-func (c *configDiskClient) Define(vm *v1.VM) (bool, error) {
+func (c *configDiskClient) Define(vm *v1.VirtualMachine) (bool, error) {
 	pending := false
 
 	cloudInitSpec := cloudinit.GetCloudInitSpec(vm)
@@ -72,6 +72,7 @@ func (c *configDiskClient) Define(vm *v1.VM) (bool, error) {
 
 	jobKey := createKey(vm)
 
+	// FIXME support re-creating the disks if the VM is down and the data changed
 	v, ok := c.jobs[jobKey]
 	if ok == false {
 		v = make(chan string, 1)
@@ -112,7 +113,7 @@ func (c *configDiskClient) Define(vm *v1.VM) (bool, error) {
 	return pending, nil
 }
 
-func (c *configDiskClient) Undefine(vm *v1.VM) error {
+func (c *configDiskClient) Undefine(vm *v1.VirtualMachine) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	jobKey := createKey(vm)
@@ -133,12 +134,23 @@ func (c *configDiskClient) UndefineUnseen(indexer cache.Store) error {
 		namespace := precond.MustNotBeEmpty(vm.GetObjectMeta().GetNamespace())
 		domain := precond.MustNotBeEmpty(vm.GetObjectMeta().GetName())
 
+		cleanup := false
+
 		key, err := cache.MetaNamespaceKeyFunc(vm)
 		if err != nil {
 			return err
 		}
-		_, exists, _ := indexer.GetByKey(key)
+
+		obj, exists, _ := indexer.GetByKey(key)
 		if exists == false {
+			cleanup = true
+		} else {
+			vm := obj.(*v1.VirtualMachine)
+			if vm.IsFinal() {
+				cleanup = true
+			}
+		}
+		if cleanup {
 			err := cloudinit.RemoveLocalData(domain, namespace)
 			if err != nil {
 				return err

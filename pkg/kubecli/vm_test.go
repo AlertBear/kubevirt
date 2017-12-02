@@ -39,7 +39,7 @@ var _ = Describe("Kubevirt VM Client", func() {
 
 	var server *ghttp.Server
 	var client KubevirtClient
-	basePath := "/apis/kubevirt.io/v1alpha1/namespaces/default/vms"
+	basePath := "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines"
 	vmPath := basePath + "/testvm"
 
 	BeforeEach(func() {
@@ -104,7 +104,7 @@ var _ = Describe("Kubevirt VM Client", func() {
 	It("should update a VM", func() {
 		vm := v1.NewMinimalVM("testvm")
 		server.AppendHandlers(ghttp.CombineHandlers(
-			ghttp.VerifyRequest("PUT", basePath),
+			ghttp.VerifyRequest("PUT", vmPath),
 			ghttp.RespondWithJSONEncoded(http.StatusOK, vm),
 		))
 		updatedVM, err := client.VM(k8sv1.NamespaceDefault).Update(vm)
@@ -130,6 +130,6 @@ var _ = Describe("Kubevirt VM Client", func() {
 	})
 })
 
-func NewVMList(vms ...v1.VM) *v1.VMList {
-	return &v1.VMList{TypeMeta: k8smetav1.TypeMeta{APIVersion: v1.GroupVersion.String(), Kind: "VMList"}, Items: vms}
+func NewVMList(vms ...v1.VirtualMachine) *v1.VirtualMachineList {
+	return &v1.VirtualMachineList{TypeMeta: k8smetav1.TypeMeta{APIVersion: v1.GroupVersion.String(), Kind: "VirtualMachineList"}, Items: vms}
 }

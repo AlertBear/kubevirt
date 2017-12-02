@@ -46,7 +46,7 @@ var _ = Describe("Storage", func() {
 	})
 
 	getTargetLogs := func(tailLines int64) string {
-		pods, err := virtClient.CoreV1().Pods(k8sv1.NamespaceDefault).List(metav1.ListOptions{LabelSelector: "app in (iscsi-demo-target)"})
+		pods, err := virtClient.CoreV1().Pods(metav1.NamespaceSystem).List(metav1.ListOptions{LabelSelector: "app in (iscsi-demo-target)"})
 		Expect(err).ToNot(HaveOccurred())
 
 		//FIXME Sometimes pods hang in terminating state, select the pod which does not have a deletion timestamp
@@ -60,7 +60,7 @@ var _ = Describe("Storage", func() {
 		Expect(podName).ToNot(BeEmpty())
 
 		logsRaw, err := virtClient.CoreV1().
-			Pods("default").
+			Pods(metav1.NamespaceSystem).
 			GetLogs(podName,
 				&k8sv1.PodLogOptions{TailLines: &tailLines}).
 			DoRaw()
@@ -78,8 +78,8 @@ var _ = Describe("Storage", func() {
 			Should(ContainSubstring("I_T nexus information:\n    LUN information:"))
 	})
 
-	RunVMAndExpectLaunch := func(vm *v1.VM, withAuth bool) {
-		obj, err := virtClient.RestClient().Post().Resource("vms").Namespace(tests.NamespaceTestDefault).Body(vm).Do().Get()
+	RunVMAndExpectLaunch := func(vm *v1.VirtualMachine, withAuth bool) {
+		obj, err := virtClient.RestClient().Post().Resource("virtualmachines").Namespace(tests.NamespaceTestDefault).Body(vm).Do().Get()
 		Expect(err).To(BeNil())
 		tests.WaitForSuccessfulVMStart(obj)
 
@@ -99,7 +99,7 @@ var _ = Describe("Storage", func() {
 	Context("Given a fresh iSCSI target", func() {
 
 		It("should be available and ready", func() {
-			logs := getTargetLogs(70)
+			logs := getTargetLogs(75)
 			Expect(logs).To(ContainSubstring("Target 1: iqn.2017-01.io.kubevirt:sn.42"))
 			Expect(logs).To(ContainSubstring("Driver: iscsi"))
 			Expect(logs).To(ContainSubstring("State: ready"))
@@ -148,5 +148,15 @@ var _ = Describe("Storage", func() {
 			RunVMAndExpectLaunch(vm, true)
 			close(done)
 		}, 30)
+
+		It("should not modify the VM spec on status update", func() {
+			vm := tests.NewRandomVMWithPVC("disk-auth-alpine")
+			vm, err := virtClient.VM(tests.NamespaceTestDefault).Create(vm)
+			Expect(err).To(BeNil())
+			tests.WaitForSuccessfulVMStartWithTimeout(vm, 60)
+			startedVM, err := virtClient.VM(tests.NamespaceTestDefault).Get(vm.ObjectMeta.Name, metav1.GetOptions{})
+			Expect(err).To(BeNil())
+			Expect(startedVM.Spec).To(Equal(vm.Spec))
+		})
 	})
 })

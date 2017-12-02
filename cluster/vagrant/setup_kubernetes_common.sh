@@ -20,6 +20,10 @@
 setenforce 0
 sed -i "s/^SELINUX=.*/SELINUX=permissive/" /etc/selinux/config
 
+# Disable swap
+swapoff -a
+sed -i '/ swap / s/^/#/' /etc/fstab
+
 systemctl stop firewalld NetworkManager || :
 systemctl disable firewalld NetworkManager || :
 # Make sure the firewall is never enabled again
@@ -64,6 +68,9 @@ gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg
 EOF
 yum install -y docker
 
+# Log to json files instead of journald
+sed -i 's/--log-driver=journald //g' /etc/sysconfig/docker
+
 # Use hard coded versions until https://github.com/kubernetes/kubeadm/issues/212 is resolved.
 # Currently older versions of kubeadm are no longer available in the rpm repos.
 # See https://github.com/kubernetes/kubeadm/issues/220 for context.
@@ -76,7 +83,7 @@ yum install -y \
 # Latest docker on CentOS uses systemd for cgroup management
 cat << EOT >>/etc/systemd/system/kubelet.service.d/09-kubeadm.conf
 [Service]
-Environment="KUBELET_EXTRA_ARGS=--cgroup-driver=systemd"
+Environment="KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --runtime-cgroups=/systemd/system.slice --kubelet-cgroups=/systemd/system.slice"
 EOT
 systemctl daemon-reload
 

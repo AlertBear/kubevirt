@@ -2,6 +2,7 @@ apiVersion: rbac.authorization.k8s.io/v1beta1
 kind: ClusterRole
 metadata:
   name: kubevirt-infra
+  namespace: kube-system
   labels:
     name: kubevirt
 rules:
@@ -28,8 +29,9 @@ rules:
   - apiGroups:
       - kubevirt.io
     resources:
-      - vms
+      - virtualmachines
       - migrations  
+      - virtualmachinereplicasets  
     verbs:
       - get
       - list
@@ -43,6 +45,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: kubevirt-infra
+  namespace: kube-system
   labels:
     name: kubevirt
 ---
@@ -50,6 +53,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: kubevirt-admin
+  namespace: kube-system
   labels:
     name: kubevirt-admin
 ---
@@ -57,6 +61,7 @@ apiVersion: rbac.authorization.k8s.io/v1beta1
 kind: ClusterRoleBinding
 metadata:
   name: kubevirt-infra
+  namespace: kube-system
   labels:
     name: kubevirt
 roleRef:
@@ -66,12 +71,13 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: kubevirt-infra
-    namespace: default
+    namespace: kube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1beta1
 kind: ClusterRoleBinding
 metadata:
   name: kubevirt-infra-cluster-admin
+  namespace: kube-system
   labels:
     name: kubevirt
 roleRef:
@@ -81,4 +87,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: kubevirt-infra
-    namespace: default
+    namespace: kube-system

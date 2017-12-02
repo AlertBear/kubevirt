@@ -33,8 +33,6 @@ import (
 	"github.com/go-kit/kit/endpoint"
 	"golang.org/x/net/context"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -50,6 +48,7 @@ type ResponseHandlerFunc func(rest.Result) (interface{}, error)
 
 func GroupVersionProxyBase(ctx context.Context, gv schema.GroupVersion) (*restful.WebService, error) {
 	ws := new(restful.WebService)
+	ws.Doc("The KubeVirt API, a virtual machine management.")
 	ws.Path(GroupVersionBasePath(gv))
 
 	virtClient, err := kubecli.GetKubevirtClient()
@@ -57,7 +56,14 @@ func GroupVersionProxyBase(ctx context.Context, gv schema.GroupVersion) (*restfu
 		return nil, err
 	}
 	autodiscover := endpoints.NewHandlerBuilder().Get().Decoder(endpoints.NoopDecoder).Endpoint(NewAutodiscoveryEndpoint(virtClient.RestClient())).Build(ctx)
-	ws.Route(ws.GET("/").Produces(mime.MIME_JSON).Writes(metav1.APIResourceList{}).To(endpoints.MakeGoRestfulWrapper(autodiscover)))
+	ws.Route(
+		ws.GET("/").Produces(mime.MIME_JSON).Writes(metav1.APIResourceList{}).
+			To(endpoints.MakeGoRestfulWrapper(autodiscover)).
+			Operation("getAPIResources").
+			Doc("Get KubeVirt API Resources").
+			Returns(http.StatusOK, "OK", metav1.APIResourceList{}).
+			Returns(http.StatusNotFound, "Not Found", nil),
+	)
 	return ws, nil
 }
 
@@ -86,66 +92,106 @@ func GenericResourceProxy(ws *restful.WebService, ctx context.Context, gvr schem
 		ws.POST(ResourceBasePath(gvr)).
 			Produces(mime.MIME_JSON, mime.MIME_YAML).
 			Consumes(mime.MIME_JSON, mime.MIME_YAML).
-			To(endpoints.MakeGoRestfulWrapper(post)).Reads(objExample).Writes(objExample), ws,
+			Operation("createNamespaced"+objKind).
+			To(endpoints.MakeGoRestfulWrapper(post)).Reads(objExample).Writes(objExample).
+			Doc("Create a "+objKind+" object.").
+			Returns(http.StatusCreated, "Created", objExample).
+			Returns(http.StatusNotFound, "Not Found", nil), ws,
 	))
 
 	ws.Route(addPutParams(
 		ws.PUT(ResourcePath(gvr)).
 			Produces(mime.MIME_JSON, mime.MIME_YAML).
 			Consumes(mime.MIME_JSON, mime.MIME_YAML).
-			To(endpoints.MakeGoRestfulWrapper(put)).Reads(objExample).Writes(objExample).Doc("test2"), ws,
+			Operation("replaceNamespaced"+objKind).
+			To(endpoints.MakeGoRestfulWrapper(put)).Reads(objExample).Writes(objExample).
+			Doc("Update a "+objKind+" object.").
+			Returns(http.StatusOK, "Replaced", objExample).
+			Returns(http.StatusNotFound, "Not Found", nil), ws,
 	))
 
 	ws.Route(addDeleteParams(
 		ws.DELETE(ResourcePath(gvr)).
 			Produces(mime.MIME_JSON, mime.MIME_YAML).
 			Consumes(mime.MIME_JSON, mime.MIME_YAML).
-			To(endpoints.MakeGoRestfulWrapper(delete)).Writes(metav1.Status{}).Doc("test3"), ws,
+			Operation("deleteNamespaced"+objKind).
+			To(endpoints.MakeGoRestfulWrapper(delete)).Reads(metav1.DeleteOptions{}).
+			Doc("Delete a "+objKind+" object.").
+			Returns(http.StatusOK, "Deleted", objExample).
+			Returns(http.StatusNotFound, "Not Found", nil), ws,
 	))
 
 	ws.Route(addGetParams(
 		ws.GET(ResourcePath(gvr)).
-			Produces(mime.MIME_JSON, mime.MIME_YAML).
-			To(endpoints.MakeGoRestfulWrapper(get)).Writes(objExample).Doc("test4"), ws,
+			Produces(mime.MIME_JSON, mime.MIME_YAML, mime.MIME_JSON_STREAM).
+			Operation("readNamespaced"+objKind).
+			To(endpoints.MakeGoRestfulWrapper(get)).Writes(objExample).
+			Doc("Get a "+objKind+" object.").
+			Returns(http.StatusOK, "OK", objExample).
+			Returns(http.StatusNotFound, "Not Found", nil), ws,
 	))
 
 	ws.Route(addGetAllNamespacesListParams(
 		ws.GET(gvr.Resource).
-			Produces(mime.MIME_JSON, mime.MIME_YAML).
-			To(endpoints.MakeGoRestfulWrapper(getListAllNamespaces)).Writes(listExample).Doc("test4"), ws,
+			Produces(mime.MIME_JSON, mime.MIME_YAML, mime.MIME_JSON_STREAM).
+			Operation("list"+objKind+"ForAllNamespaces").
+			To(endpoints.MakeGoRestfulWrapper(getListAllNamespaces)).Writes(listExample).
+			Doc("Get a list of all "+objKind+" objects.").
+			Returns(http.StatusOK, "OK", listExample).
+			Returns(http.StatusNotFound, "Not Found", nil), ws,
 	))
 
 	ws.Route(
 		ws.PATCH(ResourcePath(gvr)).
 			Produces(mime.MIME_JSON_PATCH).
-			To(endpoints.MakeGoRestfulWrapper(patch)).Writes(objExample).Doc("test5"),
+			Operation("updateNamespaced"+objKind).
+			To(endpoints.MakeGoRestfulWrapper(patch)).Writes(objExample).
+			Doc("Patch a "+objKind+" object.").
+			Returns(http.StatusOK, "Patched", objExample).
+			Returns(http.StatusNotFound, "Not Found", nil),
 	)
 
 	// TODO, implement watch. For now it is here to provide swagger doc only
 	ws.Route(addWatchGetListParams(
 		ws.GET("/watch/"+gvr.Resource).
 			Produces(mime.MIME_JSON).
-			To(NotImplementedYet).Writes(objExample), ws,
+			Operation("watch"+objKind+"ListForAllNamespaces").
+			To(NotImplementedYet).Writes(listExample).
+			Doc("Watch a "+objKind+"List object.").
+			Returns(http.StatusOK, "OK", listExample).
+			Returns(http.StatusNotFound, "Not Found", nil), ws,
 	))
 
 	// TODO, implement watch. For now it is here to provide swagger doc only
-	ws.Route(addWatchGetListParams(
+	ws.Route(addWatchNamespacedGetListParams(
 		ws.GET("/watch"+ResourceBasePath(gvr)).
+			Operation("watchNamespaced"+objKind).
 			Produces(mime.MIME_JSON).
-			To(NotImplementedYet).Writes(objExample), ws,
+			To(NotImplementedYet).Writes(objExample).
+			Doc("Watch a "+objKind+" object.").
+			Returns(http.StatusOK, "OK", objExample).
+			Returns(http.StatusNotFound, "Not Found", nil), ws,
 	))
 
-	ws.Route(addWatchGetListParams(
+	ws.Route(addGetNamespacedListParams(
 		ws.GET(ResourceBasePath(gvr)).
-			Produces(mime.MIME_JSON, mime.MIME_YAML).
+			Produces(mime.MIME_JSON, mime.MIME_YAML, mime.MIME_JSON_STREAM).
+			Operation("listNamespaced"+objKind).
 			Writes(listExample).
-			To(endpoints.MakeGoRestfulWrapper(getList)), ws,
+			To(endpoints.MakeGoRestfulWrapper(getList)).
+			Doc("Get a list of "+objKind+" objects.").
+			Returns(http.StatusOK, "OK", listExample).
+			Returns(http.StatusNotFound, "Not Found", nil), ws,
 	))
 
 	ws.Route(addDeleteListParams(
 		ws.DELETE(ResourceBasePath(gvr)).
+			Operation("deletecollectionNamespaced"+objKind).
 			Produces(mime.MIME_JSON, mime.MIME_YAML).
-			To(endpoints.MakeGoRestfulWrapper(deleteList)).Writes(listExample), ws,
+			To(endpoints.MakeGoRestfulWrapper(deleteList)).Writes(listExample).
+			Doc("Delete a collection of "+objKind+" objects.").
+			Returns(http.StatusOK, "Deleted", listExample).
+			Returns(http.StatusNotFound, "Not Found", nil), ws,
 	))
 
 	return ws, nil
@@ -158,30 +204,46 @@ func ResourceProxyAutodiscovery(ctx context.Context, gvr schema.GroupVersionReso
 	}
 	autodiscover := endpoints.NewHandlerBuilder().Get().Decoder(endpoints.NoopDecoder).Endpoint(NewAutodiscoveryEndpoint(virtClient.RestClient())).Build(ctx)
 	ws := new(restful.WebService)
-	ws.Route(ws.GET(GroupBasePath(gvr.GroupVersion())).Produces(mime.MIME_JSON).Writes(metav1.APIGroup{}).To(endpoints.MakeGoRestfulWrapper(autodiscover)))
+	ws.Route(ws.GET(GroupBasePath(gvr.GroupVersion())).
+		Produces(mime.MIME_JSON).Writes(metav1.APIGroup{}).
+		To(endpoints.MakeGoRestfulWrapper(autodiscover)).
+		Doc("Get a KubeVirt API group").
+		Operation("getAPIGroup").
+		Returns(http.StatusOK, "OK", metav1.APIGroup{}).
+		Returns(http.StatusNotFound, "Not Found", nil))
 	return ws, nil
 }
 
 func addWatchGetListParams(builder *restful.RouteBuilder, ws *restful.WebService) *restful.RouteBuilder {
-	return builder.Param(NamespaceParam(ws)).Param(fieldSelectorParam(ws)).Param(labelSelectorParam(ws)).
+	return builder.Param(fieldSelectorParam(ws)).Param(labelSelectorParam(ws)).
 		Param(ws.QueryParameter("resourceVersion", "When specified with a watch call, shows changes that occur after that particular version of a resource. Defaults to changes from the beginning of history.")).
-		Param(ws.QueryParameter("timeoutSeconds", "TimeoutSeconds for the list/watch call.").DataType("int"))
+		Param(ws.QueryParameter("timeoutSeconds", "TimeoutSeconds for the list/watch call.").DataType("integer"))
+}
+
+func addWatchNamespacedGetListParams(builder *restful.RouteBuilder, ws *restful.WebService) *restful.RouteBuilder {
+	return addWatchGetListParams(builder.Param(NamespaceParam(ws)), ws)
 }
 
 func addGetAllNamespacesListParams(builder *restful.RouteBuilder, ws *restful.WebService) *restful.RouteBuilder {
 	return builder.Param(fieldSelectorParam(ws)).Param(labelSelectorParam(ws)).
 		Param(ws.QueryParameter("resourceVersion", "When specified with a watch call, shows changes that occur after that particular version of a resource. Defaults to changes from the beginning of history.")).
-		Param(ws.QueryParameter("timeoutSeconds", "TimeoutSeconds for the list/watch call.").DataType("int"))
+		Param(ws.QueryParameter("timeoutSeconds", "TimeoutSeconds for the list/watch call.").DataType("integer")).
+		Param(ws.QueryParameter("watch", "Watch for changes to the described resources and return them as a stream of add, update, and remove notifications. Specify resourceVersion.").DataType("boolean"))
 }
 
 func addDeleteListParams(builder *restful.RouteBuilder, ws *restful.WebService) *restful.RouteBuilder {
-	return builder.Param(NameParam(ws)).Param(fieldSelectorParam(ws)).Param(labelSelectorParam(ws))
+	return builder.Param(fieldSelectorParam(ws)).Param(labelSelectorParam(ws))
 }
 
 func addGetParams(builder *restful.RouteBuilder, ws *restful.WebService) *restful.RouteBuilder {
-	return builder.Param(NamespaceParam(ws)).Param(NameParam(ws)).
+	return addGetNamespacedListParams(builder.Param(NameParam(ws)), ws)
+}
+
+func addGetNamespacedListParams(builder *restful.RouteBuilder, ws *restful.WebService) *restful.RouteBuilder {
+	return builder.Param(NamespaceParam(ws)).
 		Param(ws.QueryParameter("export", "Should this value be exported. Export strips fields that a user can not specify.").DataType("boolean")).
-		Param(ws.QueryParameter("exact", "Should the export be exact. Exact export maintains cluster-specific fields like 'Namespace'").DataType("boolean"))
+		Param(ws.QueryParameter("exact", "Should the export be exact. Exact export maintains cluster-specific fields like 'Namespace'").DataType("boolean")).
+		Param(ws.QueryParameter("watch", "Watch for changes to the described resources and return them as a stream of add, update, and remove notifications. Specify resourceVersion.").DataType("boolean"))
 }
 
 func addPostParams(builder *restful.RouteBuilder, ws *restful.WebService) *restful.RouteBuilder {
@@ -214,8 +276,12 @@ func fieldSelectorParam(ws *restful.WebService) *restful.Parameter {
 
 func NewGenericDeleteEndpoint(cli *rest.RESTClient, gvr schema.GroupVersionResource, response ResponseHandlerFunc) endpoint.Endpoint {
 	return func(ctx context.Context, payload interface{}) (interface{}, error) {
-		metadata := payload.(*endpoints.Metadata)
-		result := cli.Delete().Namespace(metadata.Namespace).Resource(gvr.Resource).Name(metadata.Name).Do()
+		p := payload.(*endpoints.PutObject)
+		del := p.Payload
+		if p.Payload == nil {
+			del = &metav1.DeleteOptions{}
+		}
+		result := cli.Delete().Namespace(p.Metadata.Namespace).Resource(gvr.Resource).Name(p.Metadata.Name).Body(del).Do()
 		return response(result)
 	}
 }
@@ -227,17 +293,7 @@ func NewGenericGetListEndpoint(cli *rest.RESTClient, gvr schema.GroupVersionReso
 		if err != nil {
 			return middleware.NewBadRequestError(err.Error()), nil
 		}
-		fieldSelector, err := fields.ParseSelector(listOptions.FieldSelector)
-		if err != nil {
-			return middleware.NewBadRequestError(err.Error()), nil
-		}
-		labelSelector, err := labels.Parse(listOptions.LabelSelector)
-		if err != nil {
-			return middleware.NewBadRequestError(err.Error()), nil
-		}
 		result := cli.Get().Namespace(metadata.Namespace).
-			FieldsSelectorParam(fieldSelector).
-			LabelsSelectorParam(labelSelector).
 			Timeout(time.Duration(*listOptions.TimeoutSeconds) * time.Second).
 			Resource(gvr.Resource).Do()
 		return response(result)
@@ -251,17 +307,7 @@ func NewGenericDeleteListEndpoint(cli *rest.RESTClient, gvr schema.GroupVersionR
 		if err != nil {
 			return middleware.NewBadRequestError(err.Error()), nil
 		}
-		fieldSelector, err := fields.ParseSelector(listOptions.FieldSelector)
-		if err != nil {
-			return middleware.NewBadRequestError(err.Error()), nil
-		}
-		labelSelector, err := labels.Parse(listOptions.LabelSelector)
-		if err != nil {
-			return middleware.NewBadRequestError(err.Error()), nil
-		}
 		result := cli.Delete().Namespace(metadata.Namespace).
-			FieldsSelectorParam(fieldSelector).
-			LabelsSelectorParam(labelSelector).
 			Timeout(time.Duration(*listOptions.TimeoutSeconds) * time.Second).
 			Resource(gvr.Resource).Do()
 		return response(result)

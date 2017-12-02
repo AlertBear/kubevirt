@@ -28,28 +28,27 @@ import (
 	"strings"
 
 	"kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/log"
 	"kubevirt.io/kubevirt/pkg/precond"
 	registrydisk "kubevirt.io/kubevirt/pkg/registry-disk"
 )
 
 type TemplateService interface {
-	RenderLaunchManifest(*v1.VM) (*kubev1.Pod, error)
-	RenderMigrationJob(*v1.VM, *kubev1.Node, *kubev1.Node, *kubev1.Pod, *v1.MigrationHostInfo) (*kubev1.Pod, error)
+	RenderLaunchManifest(*v1.VirtualMachine) (*kubev1.Pod, error)
+	RenderMigrationJob(*v1.VirtualMachine, *kubev1.Node, *kubev1.Node, *kubev1.Pod, *v1.MigrationHostInfo) (*kubev1.Pod, error)
 }
 
 type templateService struct {
 	launcherImage string
 	migratorImage string
-	socketBaseDir string
+	virtShareDir  string
 }
 
-func (t *templateService) RenderLaunchManifest(vm *v1.VM) (*kubev1.Pod, error) {
+func (t *templateService) RenderLaunchManifest(vm *v1.VirtualMachine) (*kubev1.Pod, error) {
 	precond.MustNotBeNil(vm)
 	domain := precond.MustNotBeEmpty(vm.GetObjectMeta().GetName())
 	namespace := precond.MustNotBeEmpty(vm.GetObjectMeta().GetNamespace())
 	uid := precond.MustNotBeEmpty(string(vm.GetObjectMeta().GetUID()))
-	socketDir := t.socketBaseDir + "/" + namespace + "/" + domain
 
 	initialDelaySeconds := 2
 	timeoutSeconds := 5
@@ -63,16 +62,16 @@ func (t *templateService) RenderLaunchManifest(vm *v1.VM) (*kubev1.Pod, error) {
 		Image:           t.launcherImage,
 		ImagePullPolicy: kubev1.PullIfNotPresent,
 		Command: []string{"/virt-launcher",
-			"--qemu-timeout", "60s",
+			"--qemu-timeout", "5m",
 			"--name", domain,
 			"--namespace", namespace,
-			"--socket-dir", t.socketBaseDir,
+			"--kubevirt-share-dir", t.virtShareDir,
 			"--readiness-file", "/tmp/healthy",
 		},
 		VolumeMounts: []kubev1.VolumeMount{
 			{
-				Name:      "sockets",
-				MountPath: socketDir,
+				Name:      "virt-share-dir",
+				MountPath: t.virtShareDir,
 			},
 		},
 		ReadinessProbe: &kubev1.Probe{
@@ -92,10 +91,19 @@ func (t *templateService) RenderLaunchManifest(vm *v1.VM) (*kubev1.Pod, error) {
 		},
 	}
 
-	containers, err := registrydisk.GenerateContainers(vm)
+	containers, volumes, err := registrydisk.GenerateContainers(vm)
 	if err != nil {
 		return nil, err
 	}
+
+	volumes = append(volumes, kubev1.Volume{
+		Name: "virt-share-dir",
+		VolumeSource: kubev1.VolumeSource{
+			HostPath: &kubev1.HostPathVolumeSource{
+				Path: t.virtShareDir,
+			},
+		},
+	})
 	containers = append(containers, container)
 
 	// TODO use constants for labels
@@ -109,26 +117,26 @@ func (t *templateService) RenderLaunchManifest(vm *v1.VM) (*kubev1.Pod, error) {
 			},
 		},
 		Spec: kubev1.PodSpec{
+			HostPID:       true,
 			RestartPolicy: kubev1.RestartPolicyNever,
 			Containers:    containers,
 			NodeSelector:  vm.Spec.NodeSelector,
-			Volumes: []kubev1.Volume{
-				{
-					Name: "sockets",
-					VolumeSource: kubev1.VolumeSource{
-						HostPath: &kubev1.HostPathVolumeSource{
-							Path: socketDir,
-						},
-					},
-				},
-			},
+			Volumes:       volumes,
 		},
+	}
+
+	if vm.Spec.Affinity != nil {
+		pod.Spec.Affinity = &kubev1.Affinity{}
+
+		if vm.Spec.Affinity.NodeAffinity != nil {
+			pod.Spec.Affinity.NodeAffinity = vm.Spec.Affinity.NodeAffinity
+		}
 	}
 
 	return &pod, nil
 }
 
-func (t *templateService) RenderMigrationJob(vm *v1.VM, sourceNode *kubev1.Node, targetNode *kubev1.Node, targetPod *kubev1.Pod, targetHostInfo *v1.MigrationHostInfo) (*kubev1.Pod, error) {
+func (t *templateService) RenderMigrationJob(vm *v1.VirtualMachine, sourceNode *kubev1.Node, targetNode *kubev1.Node, targetPod *kubev1.Pod, targetHostInfo *v1.MigrationHostInfo) (*kubev1.Pod, error) {
 	srcAddr := ""
 	dstAddr := ""
 	for _, addr := range sourceNode.Status.Addresses {
@@ -139,7 +147,7 @@ func (t *templateService) RenderMigrationJob(vm *v1.VM, sourceNode *kubev1.Node,
 	}
 	if srcAddr == "" {
 		err := fmt.Errorf("migration source node is unreachable")
-		logging.DefaultLogger().Error().Msg("migration target node is unreachable")
+		log.Log.Error("migration target node is unreachable")
 		return nil, err
 	}
 	srcUri := fmt.Sprintf("qemu+tcp://%s/system", srcAddr)
@@ -152,7 +160,7 @@ func (t *templateService) RenderMigrationJob(vm *v1.VM, sourceNode *kubev1.Node,
 	}
 	if dstAddr == "" {
 		err := fmt.Errorf("migration target node is unreachable")
-		logging.DefaultLogger().Error().Msg("migration target node is unreachable")
+		log.Log.Error("migration target node is unreachable")
 		return nil, err
 	}
 	destUri := fmt.Sprintf("qemu+tcp://%s/system", dstAddr)
@@ -179,7 +187,6 @@ func (t *templateService) RenderMigrationJob(vm *v1.VM, sourceNode *kubev1.Node,
 						"--namespace", vm.ObjectMeta.Namespace,
 						"--slice", targetHostInfo.Slice,
 						"--controller", strings.Join(targetHostInfo.Controller, ","),
-						"--pidns", targetHostInfo.PidNS,
 					},
 				},
 			},
@@ -189,13 +196,13 @@ func (t *templateService) RenderMigrationJob(vm *v1.VM, sourceNode *kubev1.Node,
 	return &job, nil
 }
 
-func NewTemplateService(launcherImage string, migratorImage string, socketDir string) (TemplateService, error) {
+func NewTemplateService(launcherImage string, migratorImage string, virtShareDir string) (TemplateService, error) {
 	precond.MustNotBeEmpty(launcherImage)
 	precond.MustNotBeEmpty(migratorImage)
 	svc := templateService{
 		launcherImage: launcherImage,
 		migratorImage: migratorImage,
-		socketBaseDir: socketDir,
+		virtShareDir:  virtShareDir,
 	}
 	return &svc, nil
 }

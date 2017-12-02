@@ -20,19 +20,12 @@
 package cloudinit
 
 import (
-	"bytes"
-	"crypto/md5"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"os/user"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	model "github.com/jeevatkm/go-model"
@@ -40,8 +33,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"kubevirt.io/kubevirt/pkg/api/v1"
+	diskutils "kubevirt.io/kubevirt/pkg/ephemeral-disk-utils"
 	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/log"
 	"kubevirt.io/kubevirt/pkg/precond"
 )
 
@@ -74,7 +68,7 @@ func defaultIsoFunc(isoOutFile string, inFiles []string) error {
 
 	err := cmd.Start()
 	if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("genisoimage cmd failed to start while generating iso file %s", isoOutFile))
+		log.Log.V(2).Reason(err).Errorf("genisoimage cmd failed to start while generating iso file %s", isoOutFile)
 		return err
 	}
 
@@ -86,112 +80,16 @@ func defaultIsoFunc(isoOutFile string, inFiles []string) error {
 	for {
 		select {
 		case <-timeout:
-			logging.DefaultLogger().V(2).Error().Msg(fmt.Sprintf("Timed out generating cloud-init iso at path %s", isoOutFile))
+			log.Log.V(2).Errorf("Timed out generating cloud-init iso at path %s", isoOutFile)
 			cmd.Process.Kill()
 		case err := <-done:
 			if err != nil {
-				logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("genisoimage returned non-zero exit code while generating iso file %s", isoOutFile))
+				log.Log.V(2).Reason(err).Errorf("genisoimage returned non-zero exit code while generating iso file %s", isoOutFile)
 				return err
 			}
 			return nil
 		}
 	}
-}
-
-func removeFile(path string) error {
-	err := os.Remove(path)
-	if err != nil && os.IsNotExist(err) {
-		return nil
-	} else if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("failed to remove cloud-init temporary data file %s", path))
-		return err
-	}
-	return nil
-}
-
-func fileExists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	exists := false
-
-	if err == nil {
-		exists = true
-	} else if os.IsNotExist(err) {
-		err = nil
-	}
-	return exists, err
-}
-
-func md5CheckSum(filePath string) ([]byte, error) {
-	var result []byte
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		return result, err
-	}
-	defer file.Close()
-
-	hash := md5.New()
-	_, err = io.Copy(hash, file)
-
-	if err != nil {
-		return result, err
-	}
-
-	result = hash.Sum(result)
-	return result, nil
-}
-
-func setFileOwnership(username string, file string) error {
-	usrObj, err := user.Lookup(username)
-	if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("unable to look up username %s", username))
-		return err
-	}
-
-	uid, err := strconv.Atoi(usrObj.Uid)
-	if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("unable to find uid for username %s", username))
-		return err
-	}
-
-	gid, err := strconv.Atoi(usrObj.Gid)
-	if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("unable to find gid for username %s", username))
-		return err
-	}
-
-	return os.Chown(file, uid, gid)
-}
-
-func filesAreEqual(path1 string, path2 string) (bool, error) {
-	exists, err := fileExists(path1)
-	if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("unexpected error encountered while attempting to determine if %s exists", path1))
-		return false, err
-	} else if exists == false {
-		return false, nil
-	}
-
-	exists, err = fileExists(path2)
-	if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("unexpected error encountered while attempting to determine if %s exists", path2))
-		return false, err
-	} else if exists == false {
-		return false, nil
-	}
-
-	sum1, err := md5CheckSum(path1)
-	if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("calculating md5 checksum failed for %s", path1))
-		return false, err
-	}
-	sum2, err := md5CheckSum(path2)
-	if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("calculating md5 checksum failed for %s", path2))
-		return false, err
-	}
-
-	return bytes.Equal(sum1, sum2), nil
 }
 
 // The unit test suite uses this function
@@ -205,13 +103,12 @@ func SetLocalDataOwner(user string) {
 }
 
 func SetLocalDirectory(dir string) error {
-
 	err := os.MkdirAll(dir, 0755)
 	if err != nil {
 		return errors.New(fmt.Sprintf("Unable to initalize cloudInit local cache directory (%s). %v", dir, err))
 	}
 
-	exists, err := fileExists(dir)
+	exists, err := diskutils.FileExists(dir)
 	if err != nil {
 		return errors.New(fmt.Sprintf("CloudInit local cache directory (%s) does not exist or is inaccessible. %v", dir, err))
 	} else if exists == false {
@@ -229,7 +126,7 @@ func GetDomainBasePath(domain string, namespace string) string {
 // This is called right before a VM is defined with libvirt.
 // If the cloud-init type requires altering the domain, this
 // is the place to do that.
-func MapCloudInitDisks(vm *v1.VM) (*v1.VM, error) {
+func MapCloudInitDisks(vm *v1.VirtualMachine) (*v1.VirtualMachine, error) {
 	namespace := precond.MustNotBeEmpty(vm.GetObjectMeta().GetNamespace())
 	domain := precond.MustNotBeEmpty(vm.GetObjectMeta().GetName())
 
@@ -238,15 +135,10 @@ func MapCloudInitDisks(vm *v1.VM) (*v1.VM, error) {
 		return vm, nil
 	}
 
-	err := ValidateArgs(spec)
-	if err != nil {
-		return vm, err
-	}
-
 	dataSource := getDataSource(spec)
 	switch dataSource {
 	case dataSourceNoCloud:
-		vmCopy := &v1.VM{}
+		vmCopy := &v1.VirtualMachine{}
 		model.Copy(vmCopy, vm)
 		filePath := fmt.Sprintf("%s/%s", GetDomainBasePath(domain, namespace), noCloudFile)
 
@@ -295,7 +187,7 @@ func ValidateArgs(spec *v1.CloudInitSpec) error {
 }
 
 // Place metadata auto-generation code in here
-func ApplyMetadata(vm *v1.VM) {
+func ApplyMetadata(vm *v1.VirtualMachine) {
 	spec := GetCloudInitSpec(vm)
 	if spec == nil {
 		return
@@ -311,7 +203,7 @@ func ApplyMetadata(vm *v1.VM) {
 			return
 		}
 		// TODO Put local-hostname in MetaData once we get pod DNS working with VMs
-		msg := fmt.Sprintf("instance-id: %s.%s\n", domain, namespace)
+		msg := fmt.Sprintf("{ \"instance-id\": \"%s.%s\" }\n", domain, namespace)
 		spec.NoCloudData.MetaDataBase64 = base64.StdEncoding.EncodeToString([]byte(msg))
 	}
 }
@@ -325,7 +217,7 @@ func RemoveLocalData(domain string, namespace string) error {
 	return err
 }
 
-func GetCloudInitSpec(vm *v1.VM) *v1.CloudInitSpec {
+func GetCloudInitSpec(vm *v1.VirtualMachine) *v1.CloudInitSpec {
 	// search various places cloud init spec may live.
 	// at the moment, cloud init only exists on disks.
 	for _, disk := range vm.Spec.Domain.Devices.Disks {
@@ -383,7 +275,7 @@ func GenerateLocalData(domain string, namespace string, spec *v1.CloudInitSpec) 
 	domainBasePath := GetDomainBasePath(domain, namespace)
 	err = os.MkdirAll(domainBasePath, 0755)
 	if err != nil {
-		logging.DefaultLogger().V(2).Error().Reason(err).Msg(fmt.Sprintf("unable to create cloud-init base path %s", domainBasePath))
+		log.Log.V(2).Reason(err).Errorf("unable to create cloud-init base path %s", domainBasePath)
 		return err
 	}
 
@@ -396,9 +288,9 @@ func GenerateLocalData(domain string, namespace string, spec *v1.CloudInitSpec) 
 		userData64 := spec.NoCloudData.UserDataBase64
 		metaData64 := spec.NoCloudData.MetaDataBase64
 
-		removeFile(userFile)
-		removeFile(metaFile)
-		removeFile(isoStaging)
+		diskutils.RemoveFile(userFile)
+		diskutils.RemoveFile(metaFile)
+		diskutils.RemoveFile(isoStaging)
 
 		userDataBytes, err := base64.StdEncoding.DecodeString(userData64)
 		if err != nil {
@@ -425,66 +317,38 @@ func GenerateLocalData(domain string, namespace string, spec *v1.CloudInitSpec) 
 		if err != nil {
 			return err
 		}
-		removeFile(metaFile)
-		removeFile(userFile)
+		diskutils.RemoveFile(metaFile)
+		diskutils.RemoveFile(userFile)
 
-		err = setFileOwnership(cloudInitOwner, isoStaging)
+		err = diskutils.SetFileOwnership(cloudInitOwner, isoStaging)
 		if err != nil {
 			return err
 		}
 
-		isEqual, err := filesAreEqual(iso, isoStaging)
+		isEqual, err := diskutils.FilesAreEqual(iso, isoStaging)
 		if err != nil {
 			return err
 		}
 
 		// Only replace the dynamically generated iso if it has a different checksum
 		if isEqual {
-			removeFile(isoStaging)
+			diskutils.RemoveFile(isoStaging)
 		} else {
-			removeFile(iso)
+			diskutils.RemoveFile(iso)
 			err = os.Rename(isoStaging, iso)
 			if err != nil {
 				// This error is not something we need to block iso creation for.
-				logging.DefaultLogger().Error().Reason(err).Msg(fmt.Sprintf("Cloud-init failed to rename file %s to %s", isoStaging, iso))
+				log.Log.Reason(err).Errorf("Cloud-init failed to rename file %s to %s", isoStaging, iso)
 				return err
 			}
 		}
 
-		logging.DefaultLogger().V(2).Info().Msg(fmt.Sprintf("generated nocloud iso file %s", iso))
+		log.Log.V(2).Infof("generated nocloud iso file %s", iso)
 	}
 	return nil
 }
 
 // Lists all vms cloud-init has local data for
-func ListVmWithLocalData() ([]*v1.VM, error) {
-	var keys []*v1.VM
-
-	err := filepath.Walk(cloudInitLocalDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() == false {
-			return nil
-		}
-
-		relativePath := strings.TrimPrefix(path, cloudInitLocalDir+"/")
-		if relativePath == "" {
-			return nil
-		}
-		dirs := strings.Split(relativePath, "/")
-		if len(dirs) != 2 {
-			return nil
-		}
-
-		namespace := dirs[0]
-		domain := dirs[1]
-		if namespace == "" || domain == "" {
-			return nil
-		}
-		keys = append(keys, v1.NewVMReferenceFromNameWithNS(dirs[0], dirs[1]))
-		return nil
-	})
-
-	return keys, err
+func ListVmWithLocalData() ([]*v1.VirtualMachine, error) {
+	return diskutils.ListVmWithEphemeralDisk(cloudInitLocalDir)
 }

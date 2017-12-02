@@ -33,21 +33,22 @@ import (
 	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
 	"kubevirt.io/kubevirt/pkg/api/v1"
 	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/log"
 	"kubevirt.io/kubevirt/pkg/virt-controller/services"
 )
 
 var _ = Describe("Migration", func() {
-
+	var recorder *record.FakeRecorder
 	var (
 		app            VirtControllerApp = VirtControllerApp{}
 		server         *ghttp.Server
 		migration      *v1.Migration
-		vm             *v1.VM
+		vm             *v1.VirtualMachine
 		pod            *clientv1.Pod
 		podList        clientv1.PodList
 		migrationKey   interface{}
@@ -59,7 +60,7 @@ var _ = Describe("Migration", func() {
 		destNode       kubev1.Node
 	)
 
-	logging.DefaultLogger().SetIOWriter(GinkgoWriter)
+	log.Log.SetIOWriter(GinkgoWriter)
 
 	destinationNodeName := "mynode"
 	sourceNodeName := "sourcenode"
@@ -77,6 +78,8 @@ var _ = Describe("Migration", func() {
 
 		app.migrationCache = cache.NewIndexer(cache.DeletionHandlingMetaNamespaceKeyFunc, nil)
 		app.migrationQueue = workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+		recorder = record.NewFakeRecorder(100)
+		app.migrationRecorder = recorder
 
 		app.initCommon()
 		// Create a VM which is being scheduled
@@ -142,12 +145,12 @@ var _ = Describe("Migration", func() {
 
 	})
 
-	buildExpectedVM := func(phase v1.VMPhase) *v1.VM {
+	buildExpectedVM := func(phase v1.VMPhase) *v1.VirtualMachine {
 
 		obj, err := conversion.NewCloner().DeepCopy(vm)
 		Expect(err).ToNot(HaveOccurred())
 
-		expectedVM := obj.(*v1.VM)
+		expectedVM := obj.(*v1.VirtualMachine)
 		expectedVM.Status.Phase = phase
 		expectedVM.Status.MigrationNodeName = pod.Spec.NodeName
 		expectedVM.Spec.NodeSelector = map[string]string{"beta.kubernetes.io/arch": "amd64"}
@@ -187,6 +190,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(4))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(0))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("failed GET oF VM should requeue", func() {
@@ -202,6 +206,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(1))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(1))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("failed GET oF Pod List should requeue", func() {
@@ -218,6 +223,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(2))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(1))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("Should Mark Migration as failed if VM Not found.", func() {
@@ -233,6 +239,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(2))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(0))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("should requeue if VM Not found and Migration update error.", func() {
@@ -247,6 +254,7 @@ var _ = Describe("Migration", func() {
 			app.migrationController.Execute()
 			Expect(len(server.ReceivedRequests())).To(Equal(2))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(1))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("Should mark Migration failed if VM not running ", func() {
@@ -260,6 +268,7 @@ var _ = Describe("Migration", func() {
 			app.migrationController.Execute()
 			Expect(len(server.ReceivedRequests())).To(Equal(2))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(0))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("Should Requeue if VM not running and updateMigratio0n Failure", func() {
@@ -273,6 +282,7 @@ var _ = Describe("Migration", func() {
 			app.migrationController.Execute()
 			Expect(len(server.ReceivedRequests())).To(Equal(2))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(1))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("should requeue if Migration update fails", func() {
@@ -291,6 +301,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(4))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(1))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("should fail if conflicting VM and Migration have conflicting Node Selectors", func() {
@@ -308,6 +319,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(1))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(1))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("should requeue if create of the Target Pod fails ", func() {
@@ -326,6 +338,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(3))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(1))
+			Expect(recorder.Events).To(BeEmpty())
 		})
 
 		It("should fail if another migration is in process.", func(done Done) {
@@ -349,6 +362,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(3))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(0))
+			Expect(recorder.Events).To(BeEmpty())
 			close(done)
 		}, 10)
 
@@ -373,6 +387,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(3))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(1))
+			Expect(recorder.Events).To(BeEmpty())
 
 			close(done)
 		}, 10)
@@ -407,6 +422,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(3))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(0))
+			Expect(recorder.Events).To(BeEmpty())
 
 			close(done)
 		}, 10)
@@ -445,6 +461,7 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(3))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(0))
+			Expect(recorder.Events).To(BeEmpty())
 
 			close(done)
 		}, 10)
@@ -489,6 +506,8 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(4))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(0))
+			Expect(<-recorder.Events).To(ContainSubstring(v1.StartedVirtualMachineMigration.String()))
+			Expect(recorder.Events).To(BeEmpty())
 
 			close(done)
 		}, 10)
@@ -541,6 +560,8 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(5))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(0))
+			Expect(<-recorder.Events).To(ContainSubstring(v1.SucceededVirtualMachineMigration.String()))
+			Expect(recorder.Events).To(BeEmpty())
 
 			close(done)
 		}, 10)
@@ -590,6 +611,8 @@ var _ = Describe("Migration", func() {
 
 			Expect(len(server.ReceivedRequests())).To(Equal(5))
 			Expect(app.migrationQueue.NumRequeues(migrationKey)).Should(Equal(0))
+			Expect(<-recorder.Events).To(ContainSubstring(v1.FailedVirtualMachineMigration.String()))
+			Expect(recorder.Events).To(BeEmpty())
 
 			close(done)
 		}, 10)
@@ -719,23 +742,23 @@ func handleGetPodListAuthError(podList clientv1.PodList) http.HandlerFunc {
 	)
 }
 
-func handleGetTestVM(expectedVM *v1.VM) http.HandlerFunc {
+func handleGetTestVM(expectedVM *v1.VirtualMachine) http.HandlerFunc {
 	return ghttp.CombineHandlers(
-		ghttp.VerifyRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/vms/testvm"),
+		ghttp.VerifyRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines/testvm"),
 		ghttp.RespondWithJSONEncoded(http.StatusOK, expectedVM),
 	)
 }
 
 func handleGetTestVMNotFound() http.HandlerFunc {
 	return ghttp.CombineHandlers(
-		ghttp.VerifyRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/vms/testvm"),
+		ghttp.VerifyRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines/testvm"),
 		ghttp.RespondWithJSONEncoded(http.StatusNotFound, ""),
 	)
 }
 
-func handleGetTestVMAuthError(expectedVM *v1.VM) http.HandlerFunc {
+func handleGetTestVMAuthError(expectedVM *v1.VirtualMachine) http.HandlerFunc {
 	return ghttp.CombineHandlers(
-		ghttp.VerifyRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/vms/testvm"),
+		ghttp.VerifyRequest("GET", "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines/testvm"),
 		ghttp.RespondWithJSONEncoded(http.StatusForbidden, expectedVM),
 	)
 }
@@ -756,7 +779,7 @@ func mockPod(i int, label string) clientv1.Pod {
 	}
 }
 
-func mockMigrationPod(vm *v1.VM) *kubev1.Pod {
+func mockMigrationPod(vm *v1.VirtualMachine) *kubev1.Pod {
 	temlateService, err := services.NewTemplateService("whatever", "whatever", "whatever")
 	Expect(err).ToNot(HaveOccurred())
 	pod, err := temlateService.RenderLaunchManifest(vm)
@@ -766,9 +789,9 @@ func mockMigrationPod(vm *v1.VM) *kubev1.Pod {
 	return pod
 }
 
-func handlePutVM(vm *v1.VM) http.HandlerFunc {
+func handlePutVM(vm *v1.VirtualMachine) http.HandlerFunc {
 	return ghttp.CombineHandlers(
-		ghttp.VerifyRequest("PUT", "/apis/kubevirt.io/v1alpha1/namespaces/default/vms/"+vm.ObjectMeta.Name),
+		ghttp.VerifyRequest("PUT", "/apis/kubevirt.io/v1alpha1/namespaces/default/virtualmachines/"+vm.ObjectMeta.Name),
 		ghttp.VerifyJSONRepresenting(vm),
 		ghttp.RespondWithJSONEncoded(http.StatusOK, vm),
 	)

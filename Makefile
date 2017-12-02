@@ -1,14 +1,28 @@
 export GO15VENDOREXPERIMENT := 1
 
-HASH := md5sum
+UNAME := $(shell uname)
+ifeq ($(UNAME), Darwin)
+    HASH := md5
+else
+    HASH := md5sum
+endif
 
 all: build manifests
 
-generate:
+generate: sync
 	find pkg/ -name "*generated*.go" -exec rm {} -f \;
 	./hack/build-go.sh generate ${WHAT}
 	goimports -w -local kubevirt.io cmd/ pkg/ tests/
 	./hack/bootstrap-ginkgo.sh
+	(cd tools/openapispec/ && go build)
+	tools/openapispec/openapispec --dump-api-spec-path api/openapi-spec/swagger.json
+
+apidocs: generate
+	docker run -u `stat -c "%u" hack/gen-swagger-doc/` --rm \
+		-v ${PWD}:/home/gradle/kubevirt:rw,z \
+		-w /home/gradle/kubevirt \
+		gradle \
+		bash hack/gen-swagger-doc/gen-swagger-docs.sh v1 html
 
 build: checksync fmt vet compile
 
@@ -30,25 +44,29 @@ functest:
 clean:
 	./hack/build-go.sh clean ${WHAT}
 	rm ./bin -rf
+	rm tools/openapispec/openapispec -rf
 
 distclean: clean
-	find vendor/ -maxdepth 1 -mindepth 1 -not -name vendor.json -exec rm {} -rf \;
+	rm -rf vendor/
 	rm -f manifest/*.yaml
 	rm -f .glide.*.hash
+	glide cc
 
 checksync:
 	test -f .glide.yaml.hash || ${HASH} glide.yaml > .glide.yaml.hash
 	if [ "`${HASH} glide.yaml`" != "`cat .glide.yaml.hash`" ]; then \
+		glide cc; \
 		glide update --strip-vendor; \
 		${HASH} glide.yaml > .glide.yaml.hash; \
 		${HASH} glide.lock > .glide.lock.hash; \
 	elif [ "`${HASH} glide.lock`" != "`cat .glide.lock.hash`" ]; then \
-		make sync; \
-	fi
-
+ 		make sync; \
+ 	fi
+ 
 sync:
 	glide install --strip-vendor
 	${HASH} glide.lock > .glide.lock.hash
+ 
 
 docker: build
 	./hack/build-docker.sh build ${WHAT}

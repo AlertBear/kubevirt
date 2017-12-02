@@ -1,12 +1,14 @@
 metadata:
   name: testvm-ephemeral
 apiVersion: kubevirt.io/v1alpha1
-kind: VM
+kind: VirtualMachine
 spec:
   domain:
     devices:
+      graphics:
+      - type: spice
       disks:
-      - type: ContainerRegistryDisk:v1alpha
+      - type: RegistryDisk:v1alpha
         source:
           name: kubevirt/cirros-registry-disk-demo:devel
         target:
@@ -15,6 +17,10 @@ spec:
       - source:
           network: default
         type: network
+      video:
+      - type: qxl
+      consoles:
+      - type: pty
     memory:
       unit: MB
       value: 64

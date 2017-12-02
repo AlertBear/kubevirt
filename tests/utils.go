@@ -39,8 +39,14 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 
+	"io"
+
+	"github.com/google/goexpect"
+	"k8s.io/client-go/rest"
+
 	"kubevirt.io/kubevirt/pkg/api/v1"
 	"kubevirt.io/kubevirt/pkg/kubecli"
+	"kubevirt.io/kubevirt/pkg/virtctl/console"
 )
 
 type EventType string
@@ -342,11 +348,11 @@ func newPV(os string, lun int32, withAuth bool) *k8sv1.PersistentVolume {
 	PanicOnError(err)
 
 	name := fmt.Sprintf("iscsi-disk-%s-for-tests", os)
-	target := "iscsi-demo-target.default.svc.cluster.local"
+	target := "iscsi-demo-target.kube-system.svc.cluster.local"
 	label := os
 	if withAuth {
 		name = fmt.Sprintf("iscsi-auth-disk-%s-for-tests", os)
-		target = "iscsi-auth-demo-target.default.svc.cluster.local"
+		target = "iscsi-auth-demo-target.kube-system.svc.cluster.local"
 		label = fmt.Sprintf("%s-auth", os)
 	}
 
@@ -393,11 +399,14 @@ func cleanNamespaces() {
 			continue
 		}
 
+		// Remove all VirtualMachineReplicaSets
+		PanicOnError(virtCli.RestClient().Delete().Namespace(namespace).Resource("virtualmachinereplicasets").Do().Error())
+
 		// Remove all Migrations
 		PanicOnError(virtCli.RestClient().Delete().Namespace(namespace).Resource("migrations").Do().Error())
 
 		// Remove all VMs
-		PanicOnError(virtCli.RestClient().Delete().Namespace(namespace).Resource("vms").Do().Error())
+		PanicOnError(virtCli.RestClient().Delete().Namespace(namespace).Resource("virtualmachines").Do().Error())
 
 		// Remove all Pods
 		PanicOnError(virtCli.CoreV1().RESTClient().Delete().Namespace(namespace).Resource("pods").Do().Error())
@@ -420,8 +429,10 @@ func removeNamespaces() {
 	}
 
 	// Wait until the namespaces are terminated
+	fmt.Println("")
 	for _, namespace := range testNamespaces {
-		Eventually(func() bool { return errors.IsNotFound(virtCli.CoreV1().Namespaces().Delete(namespace, nil)) }, 60*time.Second, 1*time.Second).
+		fmt.Printf("Waiting for namespace %s to be removed, this can take a while ...\n", namespace)
+		Eventually(func() bool { return errors.IsNotFound(virtCli.CoreV1().Namespaces().Delete(namespace, nil)) }, 180*time.Second, 1*time.Second).
 			Should(BeTrue())
 	}
 }
@@ -486,20 +497,20 @@ func PanicOnError(err error) {
 	}
 }
 
-func NewRandomVM() *v1.VM {
+func NewRandomVM() *v1.VirtualMachine {
 	return NewRandomVMWithNS(NamespaceTestDefault)
 }
 
-func NewRandomVMWithNS(namespace string) *v1.VM {
+func NewRandomVMWithNS(namespace string) *v1.VirtualMachine {
 	return v1.NewMinimalVMWithNS(namespace, "testvm"+rand.String(5))
 }
 
-func NewRandomVMWithEphemeralDisk(containerImage string) *v1.VM {
+func NewRandomVMWithEphemeralDisk(containerImage string) *v1.VirtualMachine {
 	vm := NewRandomVM()
 	vm.Spec.Domain.Memory.Unit = "MB"
 	vm.Spec.Domain.Memory.Value = 64
 	vm.Spec.Domain.Devices.Disks = []v1.Disk{{
-		Type:   "ContainerRegistryDisk:v1alpha",
+		Type:   "RegistryDisk:v1alpha",
 		Device: "disk",
 		Source: v1.DiskSource{
 			Name: containerImage,
@@ -511,13 +522,27 @@ func NewRandomVMWithEphemeralDisk(containerImage string) *v1.VM {
 	return vm
 }
 
-func NewRandomVMWithUserData(containerImage string, cloudInitDataSource string) (*v1.VM, error) {
-
+func NewRandomVMWithEphemeralDiskAndUserdata(containerImage string, cloudInitDataSource, userData string) (*v1.VirtualMachine, error) {
+	vm := NewRandomVMWithEphemeralDisk(containerImage)
+	vm.Spec.Domain.Devices.Serials = []v1.Serial{
+		{
+			Type: "pty",
+			Target: &v1.SerialTarget{
+				Port: newUInt(0),
+			},
+		},
+	}
+	vm.Spec.Domain.Devices.Consoles = []v1.Console{
+		{
+			Type: "pty",
+			Target: &v1.ConsoleTarget{
+				Type: newString("serial"),
+				Port: newUInt(0),
+			},
+		},
+	}
 	switch cloudInitDataSource {
 	case "noCloud":
-		userData := "#cloud-config\npassword: atomic\nssh_pwauth: True\nchpasswd: { expire: False }\n"
-
-		vm := NewRandomVMWithEphemeralDisk(containerImage)
 		spec := &v1.CloudInitSpec{
 			NoCloudData: &v1.CloudInitDataSourceNoCloud{
 				UserDataBase64: base64.StdEncoding.EncodeToString([]byte(userData)),
@@ -537,7 +562,30 @@ func NewRandomVMWithUserData(containerImage string, cloudInitDataSource string) 
 	return nil, goerrors.New("Unknown cloud-init data source")
 }
 
-func NewRandomVMWithDirectLun(lun int, withAuth bool) *v1.VM {
+func NewRandomVMWithUserData(cloudInitDataSource string, userData string) (*v1.VirtualMachine, error) {
+	switch cloudInitDataSource {
+	case "noCloud":
+		vm := NewRandomVMWithSerialConsole()
+		spec := &v1.CloudInitSpec{
+			NoCloudData: &v1.CloudInitDataSourceNoCloud{
+				UserDataBase64: base64.StdEncoding.EncodeToString([]byte(userData)),
+			},
+		}
+		newDisk := v1.Disk{}
+		newDisk.Type = "file"
+		newDisk.Target = v1.DiskTarget{
+			Device: "vdb",
+		}
+		newDisk.CloudInit = spec
+
+		vm.Spec.Domain.Devices.Disks = append(vm.Spec.Domain.Devices.Disks, newDisk)
+		return vm, nil
+	}
+
+	return nil, goerrors.New("Unknown cloud-init data source")
+}
+
+func NewRandomVMWithDirectLun(lun int, withAuth bool) *v1.VirtualMachine {
 	vm := NewRandomVM()
 	vm.Spec.Domain.Memory.Unit = "MB"
 	vm.Spec.Domain.Memory.Value = 64
@@ -554,7 +602,7 @@ func NewRandomVMWithDirectLun(lun int, withAuth bool) *v1.VM {
 		},
 		Source: v1.DiskSource{
 			Host: &v1.DiskSourceHost{
-				Name: "iscsi-demo-target.default",
+				Name: "iscsi-demo-target.kube-system",
 				Port: "3260",
 			},
 			Protocol: "iscsi",
@@ -570,12 +618,12 @@ func NewRandomVMWithDirectLun(lun int, withAuth bool) *v1.VM {
 				Usage: "iscsi-demo-secret",
 			},
 		}
-		vm.Spec.Domain.Devices.Disks[0].Source.Host.Name = "iscsi-auth-demo-target.default"
+		vm.Spec.Domain.Devices.Disks[0].Source.Host.Name = "iscsi-auth-demo-target.kube-system"
 	}
 	return vm
 }
 
-func NewRandomVMWithPVC(claimName string) *v1.VM {
+func NewRandomVMWithPVC(claimName string) *v1.VirtualMachine {
 	vm := NewRandomVM()
 	vm.Spec.Domain.Memory.Unit = "MB"
 	vm.Spec.Domain.Memory.Value = 64
@@ -593,12 +641,38 @@ func NewRandomVMWithPVC(claimName string) *v1.VM {
 	return vm
 }
 
-func NewRandomMigrationForVm(vm *v1.VM) *v1.Migration {
+func NewRandomMigrationForVm(vm *v1.VirtualMachine) *v1.Migration {
 	ns := vm.GetObjectMeta().GetNamespace()
 	return v1.NewMinimalMigrationWithNS(ns, vm.ObjectMeta.Name+"migrate"+rand.String(5), vm.ObjectMeta.Name)
 }
 
-func NewRandomVMWithSerialConsole() *v1.VM {
+func NewRandomVMWithWatchdog() *v1.VirtualMachine {
+	vm := NewRandomVMWithDirectLun(2, false)
+	vm.Spec.Domain.Devices.Serials = []v1.Serial{
+		{
+			Type: "pty",
+			Target: &v1.SerialTarget{
+				Port: newUInt(0),
+			},
+		},
+	}
+	vm.Spec.Domain.Devices.Consoles = []v1.Console{
+		{
+			Type: "pty",
+			Target: &v1.ConsoleTarget{
+				Type: newString("serial"),
+				Port: newUInt(0),
+			},
+		},
+	}
+	vm.Spec.Domain.Devices.Watchdog = &v1.Watchdog{
+		Model:  "i6300esb",
+		Action: "poweroff",
+	}
+
+	return vm
+}
+func NewRandomVMWithSerialConsole() *v1.VirtualMachine {
 	vm := NewRandomVMWithPVC("disk-cirros")
 	vm.Spec.Domain.Devices.Serials = []v1.Serial{
 		{
@@ -620,7 +694,7 @@ func NewRandomVMWithSerialConsole() *v1.VM {
 	return vm
 }
 
-func NewRandomVMWithSpice() *v1.VM {
+func NewRandomVMWithSpice() *v1.VirtualMachine {
 	vm := NewRandomVM()
 	vm.Spec.Domain.Devices.Video = []v1.Video{
 		{
@@ -641,26 +715,44 @@ func NewRandomVMWithSpice() *v1.VM {
 }
 
 // Block until the specified VM started and return the target node name.
-func WaitForSuccessfulVMStart(vm runtime.Object) (nodeName string) {
-	_, ok := vm.(*v1.VM)
+func WaitForSuccessfulVMStartWithTimeout(vm runtime.Object, seconds int) (nodeName string) {
+	_, ok := vm.(*v1.VirtualMachine)
 	Expect(ok).To(BeTrue(), "Object is not of type *v1.VM")
 	virtClient, err := kubecli.GetKubevirtClient()
 	Expect(err).ToNot(HaveOccurred())
 
 	// Fetch the VM, to make sure we have a resourceVersion as a starting point for the watch
-	vmMeta := vm.(*v1.VM).ObjectMeta
-	obj, err := virtClient.RestClient().Get().Resource("vms").Namespace(vmMeta.Namespace).Name(vmMeta.Name).Do().Get()
+	vmMeta := vm.(*v1.VirtualMachine).ObjectMeta
+	obj, err := virtClient.RestClient().Get().Resource("virtualmachines").Namespace(vmMeta.Namespace).Name(vmMeta.Name).Do().Get()
 	NewObjectEventWatcher(obj).SinceWatchedObjectResourceVersion().FailOnWarnings().WaitFor(NormalEvent, v1.Started)
 
 	// FIXME the event order is wrong. First the document should be updated
-	Eventually(func() v1.VMPhase {
-		obj, err := virtClient.RestClient().Get().Resource("vms").Namespace(vmMeta.Namespace).Name(vmMeta.Name).Do().Get()
+	Eventually(func() bool {
+		obj, err := virtClient.RestClient().Get().Resource("virtualmachines").Namespace(vmMeta.Namespace).Name(vmMeta.Name).Do().Get()
 		Expect(err).ToNot(HaveOccurred())
-		fetchedVM := obj.(*v1.VM)
+		fetchedVM := obj.(*v1.VirtualMachine)
 		nodeName = fetchedVM.Status.NodeName
-		return fetchedVM.Status.Phase
-	}).Should(Equal(v1.Running))
+
+		graphicDeviceCount := 0
+		for _, src := range fetchedVM.Spec.Domain.Devices.Graphics {
+			if src.Type == "spice" || src.Type == "vnc" {
+				graphicDeviceCount++
+			}
+		}
+
+		// wait on both phase and graphics
+		if len(fetchedVM.Status.Graphics) == graphicDeviceCount &&
+			fetchedVM.Status.Phase == v1.Running {
+			return true
+		}
+		return false
+	}, time.Duration(seconds)*time.Second).Should(Equal(true))
+
 	return
+}
+
+func WaitForSuccessfulVMStart(vm runtime.Object) string {
+	return WaitForSuccessfulVMStartWithTimeout(vm, 30)
 }
 
 func GetReadyNodes() []k8sv1.Node {
@@ -688,6 +780,55 @@ func newUInt(x uint) *uint {
 	return &x
 }
 
+func NewInt32(x int32) *int32 {
+	return &x
+}
+
 func newString(x string) *string {
 	return &x
+}
+
+func NewRandomReplicaSetFromVM(vm *v1.VirtualMachine, replicas int32) *v1.VirtualMachineReplicaSet {
+	name := "replicaset" + rand.String(5)
+	rs := &v1.VirtualMachineReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "replicaset" + rand.String(5)},
+		Spec: v1.VMReplicaSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"name": name},
+			},
+			Template: &v1.VMTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"name": name},
+					Name:   vm.ObjectMeta.Name,
+				},
+				Spec: vm.Spec,
+			},
+		},
+	}
+	return rs
+}
+
+func NewConsoleExpecter(config *rest.Config, vm *v1.VirtualMachine, consoleName string, timeout time.Duration, opts ...expect.Option) (expect.Expecter, <-chan error, error) {
+	vmReader, vmWriter := io.Pipe()
+	expecterReader, expecterWriter := io.Pipe()
+	resCh := make(chan error)
+	stopChan := make(chan struct{})
+	go func() {
+		err := console.ConnectToConsole(config, vm.ObjectMeta.Namespace, vm.ObjectMeta.Name, consoleName, console.NewWebsocketCallback(vmReader, expecterWriter, stopChan))
+		resCh <- err
+	}()
+
+	return expect.SpawnGeneric(&expect.GenOptions{
+		In:  vmWriter,
+		Out: expecterReader,
+		Wait: func() error {
+			return <-resCh
+		},
+		Close: func() error {
+			close(stopChan)
+			return nil
+		},
+		Check: func() bool { return true },
+	}, timeout, opts...)
 }

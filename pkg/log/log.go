@@ -17,7 +17,7 @@
  *
  */
 
-package logging
+package log
 
 import (
 	"errors"
@@ -28,12 +28,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 )
+
+var lock sync.Mutex
 
 type logLevel int
 
@@ -99,12 +102,22 @@ var loggers = make(map[string]*FilteredLogger)
 var defaultComponent = ""
 var defaultVerbosity = 0
 
-func Logger(component string) *FilteredLogger {
-	if _, ok := loggers[component]; !ok {
+func createLogger(component string) {
+	lock.Lock()
+	defer lock.Unlock()
+	_, ok := loggers[component]
+	if ok == false {
 		logger := log.NewLogfmtLogger(os.Stderr)
 		log := MakeLogger(logger)
 		log.component = component
 		loggers[component] = log
+	}
+}
+
+func Logger(component string) *FilteredLogger {
+	_, ok := loggers[component]
+	if ok == false {
+		createLogger(component)
 	}
 	return loggers[component]
 }
@@ -112,6 +125,8 @@ func Logger(component string) *FilteredLogger {
 func DefaultLogger() *FilteredLogger {
 	return Logger(defaultComponent)
 }
+
+var Log = DefaultLogger()
 
 func (l *FilteredLogger) SetIOWriter(w io.Writer) {
 	l.logContext = log.NewContext(log.NewLogfmtLogger(w))
@@ -173,10 +188,12 @@ func (l FilteredLogger) log(skipFrames int, params ...interface{}) error {
 func (l FilteredLogger) Object(obj LoggableObject) *FilteredLogger {
 
 	name := obj.GetObjectMeta().GetName()
+	namespace := obj.GetObjectMeta().GetNamespace()
 	uid := obj.GetObjectMeta().GetUID()
 	kind := obj.GetObjectKind().GroupVersionKind().Kind
 
 	logParams := make([]interface{}, 0)
+	logParams = append(logParams, "namespace", namespace)
 	logParams = append(logParams, "name", name)
 	logParams = append(logParams, "kind", kind)
 	logParams = append(logParams, "uid", uid)
@@ -221,32 +238,52 @@ func (l FilteredLogger) V(level int) *FilteredLogger {
 	return &l
 }
 
-func (l FilteredLogger) Debug() *FilteredLogger {
-	l.currentLogLevel = DEBUG
-	return &l
-}
-
-func (l FilteredLogger) Info() *FilteredLogger {
-	l.currentLogLevel = INFO
-	return &l
-}
-
-func (l FilteredLogger) Warning() *FilteredLogger {
-	l.currentLogLevel = WARNING
-	return &l
-}
-
-func (l FilteredLogger) Error() *FilteredLogger {
-	l.currentLogLevel = ERROR
-	return &l
-}
-
-func (l FilteredLogger) Critical() *FilteredLogger {
-	l.currentLogLevel = CRITICAL
-	return &l
-}
-
 func (l FilteredLogger) Reason(err error) *FilteredLogger {
 	l.err = err
 	return &l
+}
+
+func (l FilteredLogger) Level(level logLevel) *FilteredLogger {
+	l.currentLogLevel = level
+	return &l
+}
+
+func (l FilteredLogger) Debug(msg string) {
+	l.Level(DEBUG).Msg(msg)
+}
+
+func (l FilteredLogger) Debugf(msg string, args ...interface{}) {
+	l.Level(DEBUG).Msgf(msg, args...)
+}
+
+func (l FilteredLogger) Info(msg string) {
+	l.Level(INFO).Msg(msg)
+}
+
+func (l FilteredLogger) Infof(msg string, args ...interface{}) {
+	l.Level(INFO).Msgf(msg, args...)
+}
+
+func (l FilteredLogger) Warning(msg string) {
+	l.Level(WARNING).Msg(msg)
+}
+
+func (l FilteredLogger) Warningf(msg string, args ...interface{}) {
+	l.Level(WARNING).Msgf(msg, args...)
+}
+
+func (l FilteredLogger) Error(msg string) {
+	l.Level(ERROR).Msg(msg)
+}
+
+func (l FilteredLogger) Errorf(msg string, args ...interface{}) {
+	l.Level(ERROR).Msgf(msg, args...)
+}
+
+func (l FilteredLogger) Critical(msg string) {
+	l.Level(CRITICAL).Msg(msg)
+}
+
+func (l FilteredLogger) Criticalf(msg string, args ...interface{}) {
+	l.Level(CRITICAL).Msgf(msg, args...)
 }

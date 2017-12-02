@@ -29,20 +29,20 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 
 	"kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/logging"
+	"kubevirt.io/kubevirt/pkg/log"
 )
 
 var _ = Describe("Template", func() {
 
-	logging.DefaultLogger().SetIOWriter(GinkgoWriter)
-	svc, err := NewTemplateService("kubevirt/virt-launcher", "kubevirt/virt-handler", "/var/run/libvirt")
+	log.Log.SetIOWriter(GinkgoWriter)
+	svc, err := NewTemplateService("kubevirt/virt-launcher", "kubevirt/virt-handler", "/var/run/kubevirt")
 
 	Describe("Rendering", func() {
 		Context("launch template with correct parameters", func() {
 			It("should work", func() {
 
 				Expect(err).To(BeNil())
-				pod, err := svc.RenderLaunchManifest(&v1.VM{ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "testns", UID: "1234"}, Spec: v1.VMSpec{Domain: &v1.DomainSpec{}}})
+				pod, err := svc.RenderLaunchManifest(&v1.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "testns", UID: "1234"}, Spec: v1.VMSpec{Domain: &v1.DomainSpec{}}})
 
 				Expect(err).To(BeNil())
 				Expect(pod.Spec.Containers[0].Image).To(Equal("kubevirt/virt-launcher"))
@@ -54,10 +54,10 @@ var _ = Describe("Template", func() {
 				Expect(pod.ObjectMeta.GenerateName).To(Equal("virt-launcher-testvm-----"))
 				Expect(pod.Spec.NodeSelector).To(BeEmpty())
 				Expect(pod.Spec.Containers[0].Command).To(Equal([]string{"/virt-launcher",
-					"--qemu-timeout", "60s",
+					"--qemu-timeout", "5m",
 					"--name", "testvm",
 					"--namespace", "testns",
-					"--socket-dir", "/var/run/libvirt",
+					"--kubevirt-share-dir", "/var/run/kubevirt",
 					"--readiness-file", "/tmp/healthy"}))
 			})
 		})
@@ -67,7 +67,7 @@ var _ = Describe("Template", func() {
 				nodeSelector := map[string]string{
 					"kubernetes.io/hostname": "master",
 				}
-				vm := v1.VM{ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "default", UID: "1234"}, Spec: v1.VMSpec{NodeSelector: nodeSelector, Domain: &v1.DomainSpec{}}}
+				vm := v1.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "default", UID: "1234"}, Spec: v1.VMSpec{NodeSelector: nodeSelector, Domain: &v1.DomainSpec{}}}
 
 				pod, err := svc.RenderLaunchManifest(&vm)
 
@@ -83,13 +83,41 @@ var _ = Describe("Template", func() {
 					"kubernetes.io/hostname": "master",
 				}))
 				Expect(pod.Spec.Containers[0].Command).To(Equal([]string{"/virt-launcher",
-					"--qemu-timeout", "60s",
+					"--qemu-timeout", "5m",
 					"--name", "testvm",
 					"--namespace", "default",
-					"--socket-dir", "/var/run/libvirt",
+					"--kubevirt-share-dir", "/var/run/kubevirt",
 					"--readiness-file", "/tmp/healthy"}))
-				Expect(pod.Spec.Volumes[0].HostPath.Path).To(Equal("/var/run/libvirt/default/testvm"))
-				Expect(pod.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/var/run/libvirt/default/testvm"))
+				Expect(pod.Spec.Volumes[0].HostPath.Path).To(Equal("/var/run/kubevirt"))
+				Expect(pod.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/var/run/kubevirt"))
+			})
+
+			It("should add node affinity to pod", func() {
+				nodeAffinity := kubev1.NodeAffinity{}
+				vm := v1.VirtualMachine{
+					ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "default", UID: "1234"},
+					Spec: v1.VMSpec{
+						Affinity: &v1.Affinity{NodeAffinity: &nodeAffinity},
+						Domain:   &v1.DomainSpec{},
+					},
+				}
+				pod, err := svc.RenderLaunchManifest(&vm)
+
+				Expect(err).To(BeNil())
+				Expect(pod.Spec.Affinity).To(BeEquivalentTo(&kubev1.Affinity{NodeAffinity: &nodeAffinity}))
+			})
+
+			It("should not add empty node affinity to pod", func() {
+				vm := v1.VirtualMachine{
+					ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "default", UID: "1234"},
+					Spec: v1.VMSpec{
+						Domain: &v1.DomainSpec{},
+					},
+				}
+				pod, err := svc.RenderLaunchManifest(&vm)
+
+				Expect(err).To(BeNil())
+				Expect(pod.Spec.Affinity).To(BeNil())
 			})
 		})
 		Context("migration", func() {
@@ -134,7 +162,7 @@ var _ = Describe("Template", func() {
 			})
 
 			Context("migration template", func() {
-				var vm *v1.VM
+				var vm *v1.VirtualMachine
 				var destPod *kubev1.Pod
 				var hostInfo *v1.MigrationHostInfo
 				BeforeEach(func() {
@@ -159,7 +187,7 @@ var _ = Describe("Template", func() {
 							"/migrate", "testvm", "--source", "qemu+tcp://127.0.0.2/system",
 							"--dest", "qemu+tcp://127.0.0.3/system",
 							"--node-ip", "127.0.0.3", "--namespace", "default",
-							"--slice", "slice", "--controller", "cpu,memory", "--pidns", "pidns",
+							"--slice", "slice", "--controller", "cpu,memory",
 						}
 						Expect(job.Spec.Containers[0].Command).To(Equal(refCommand))
 					})

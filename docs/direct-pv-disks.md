@@ -16,7 +16,7 @@ Volumes as a backing store for Virtual Machine disks.
 ### Use-case
 
 The primary use-case is to attach regular (writable) disks to Virtual Machines
-which are backed by Peristent Volumes.
+which are backed by Persistent Volumes.
 
 
 ## API
@@ -64,7 +64,7 @@ release: "stable"
 this is used by the VM in the following way:
 
 ```yaml
-kind: VM
+kind: VirtualMachine
 spec:
   domain:
     devices:

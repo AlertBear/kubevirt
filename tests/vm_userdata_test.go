@@ -22,7 +22,9 @@ package tests_test
 import (
 	"flag"
 	"fmt"
+	"time"
 
+	"github.com/google/goexpect"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
@@ -41,86 +43,93 @@ var _ = Describe("CloudInit UserData", func() {
 
 	virtClient, err := kubecli.GetKubevirtClient()
 	tests.PanicOnError(err)
+	virtConfig, err := kubecli.GetKubevirtClientConfig()
+	tests.PanicOnError(err)
+
+	LaunchVM := func(vm *v1.VirtualMachine) runtime.Object {
+		obj, err := virtClient.RestClient().Post().Resource("virtualmachines").Namespace(tests.NamespaceTestDefault).Body(vm).Do().Get()
+		Expect(err).To(BeNil())
+		return obj
+	}
+
+	VerifyUserDataVM := func(vm *v1.VirtualMachine, obj runtime.Object, magicStr string) {
+		_, ok := obj.(*v1.VirtualMachine)
+		Expect(ok).To(BeTrue(), "Object is not of type *v1.VM")
+		tests.WaitForSuccessfulVMStart(obj)
+
+		expecter, _, err := tests.NewConsoleExpecter(virtConfig, vm, "serial0", 10*time.Second)
+		defer expecter.Close()
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = expecter.ExpectBatch([]expect.Batcher{
+			&expect.BExp{R: magicStr},
+		}, 60*time.Second)
+		Expect(err).ToNot(HaveOccurred())
+	}
 
 	BeforeEach(func() {
 		tests.BeforeTestCleanup()
 	})
 
-	LaunchVM := func(vm *v1.VM) runtime.Object {
-		obj, err := virtClient.RestClient().Post().Resource("vms").Namespace(tests.NamespaceTestDefault).Body(vm).Do().Get()
-		Expect(err).To(BeNil())
-		return obj
-	}
-
-	VerifyUserDataVM := func(vm *v1.VM, obj runtime.Object) {
-		_, ok := obj.(*v1.VM)
-		Expect(ok).To(BeTrue(), "Object is not of type *v1.VM")
-		tests.WaitForSuccessfulVMStart(obj)
-	}
-
 	Context("CloudInit Data Source NoCloud", func() {
-		It("should launch multiple VMs with cloud-init data source NoCloud", func(done Done) {
-			num := 2
-			vms := make([]*v1.VM, 0, num)
-			objs := make([]runtime.Object, 0, num)
-			for i := 0; i < num; i++ {
-				vm, err := tests.NewRandomVMWithUserData("kubevirt/cirros-registry-disk-demo:devel", "noCloud")
-				Expect(err).ToNot(HaveOccurred())
-				obj := LaunchVM(vm)
-				vms = append(vms, vm)
-				objs = append(objs, obj)
-			}
+		It("should launch vm with cloud-init data source NoCloud", func(done Done) {
+			magicStr := "printed from cloud-init userdata"
+			userData := fmt.Sprintf("#!/bin/sh\n\necho '%s'\n", magicStr)
 
-			for idx, vm := range vms {
-				VerifyUserDataVM(vm, objs[idx])
-			}
-
+			vm, err := tests.NewRandomVMWithUserData("noCloud", userData)
+			Expect(err).ToNot(HaveOccurred())
+			obj := LaunchVM(vm)
+			VerifyUserDataVM(vm, obj, magicStr)
 			close(done)
-		}, 45)
+		}, 90)
+
+		It("should launch ephemeral vm with cloud-init data source NoCloud", func(done Done) {
+			magicStr := "printed from cloud-init userdata"
+			userData := fmt.Sprintf("#!/bin/sh\n\necho '%s'\n", magicStr)
+
+			vm, err := tests.NewRandomVMWithEphemeralDiskAndUserdata("kubevirt/cirros-registry-disk-demo:devel", "noCloud", userData)
+			Expect(err).ToNot(HaveOccurred())
+			obj := LaunchVM(vm)
+			VerifyUserDataVM(vm, obj, magicStr)
+			close(done)
+		}, 90)
+
 		It("should launch VMs with user-data in k8s secret", func(done Done) {
-			num := 2
-			vms := make([]*v1.VM, 0, num)
-			objs := make([]runtime.Object, 0, num)
-			for i := 0; i < num; i++ {
-				vm, err := tests.NewRandomVMWithUserData("kubevirt/cirros-registry-disk-demo:devel", "noCloud")
-				Expect(err).ToNot(HaveOccurred())
+			magicStr := "printed from cloud-init userdata"
+			userData := fmt.Sprintf("#!/bin/sh\n\necho '%s'\n", magicStr)
+			vm, err := tests.NewRandomVMWithUserData("noCloud", userData)
+			Expect(err).ToNot(HaveOccurred())
 
-				for _, disk := range vm.Spec.Domain.Devices.Disks {
-					if disk.CloudInit == nil {
-						continue
-					}
-
-					secretID := fmt.Sprintf("%s-test-secret", vm.GetObjectMeta().GetName())
-					spec := disk.CloudInit
-					spec.NoCloudData.UserDataSecretRef = secretID
-					userData64 := spec.NoCloudData.UserDataBase64
-					spec.NoCloudData.UserDataBase64 = ""
-
-					// Store userdata as k8s secret
-					secret := kubev1.Secret{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      secretID,
-							Namespace: vm.GetObjectMeta().GetNamespace(),
-						},
-						Type: "Opaque",
-						Data: map[string][]byte{
-							"userdata": []byte(userData64),
-						},
-					}
-					_, err := virtClient.Core().Secrets(vm.GetObjectMeta().GetNamespace()).Create(&secret)
-					Expect(err).To(BeNil())
-					break
+			for _, disk := range vm.Spec.Domain.Devices.Disks {
+				if disk.CloudInit == nil {
+					continue
 				}
-				obj := LaunchVM(vm)
-				vms = append(vms, vm)
-				objs = append(objs, obj)
-			}
 
-			for idx, vm := range vms {
-				VerifyUserDataVM(vm, objs[idx])
+				secretID := fmt.Sprintf("%s-test-secret", vm.GetObjectMeta().GetName())
+				spec := disk.CloudInit
+				spec.NoCloudData.UserDataSecretRef = secretID
+				userData64 := spec.NoCloudData.UserDataBase64
+				spec.NoCloudData.UserDataBase64 = ""
+
+				// Store userdata as k8s secret
+				secret := kubev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      secretID,
+						Namespace: vm.GetObjectMeta().GetNamespace(),
+					},
+					Type: "Opaque",
+					Data: map[string][]byte{
+						"userdata": []byte(userData64),
+					},
+				}
+				_, err := virtClient.Core().Secrets(vm.GetObjectMeta().GetNamespace()).Create(&secret)
+				Expect(err).To(BeNil())
+				break
 			}
+			obj := LaunchVM(vm)
+			VerifyUserDataVM(vm, obj, magicStr)
 
 			close(done)
-		}, 45)
+		}, 90)
 	})
 })

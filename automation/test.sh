@@ -24,10 +24,11 @@ kubectl() { cluster/kubectl.sh --core "$@"; }
 
 # Install GO
 eval "$(curl -sL https://raw.githubusercontent.com/travis-ci/gimme/master/gimme | GIMME_GO_VERSION=stable bash)"
-export GOPATH=$WORKSPACE/go
-export GOBIN=$WORKSPACE/go/bin
-export PATH=$GOPATH/bin:$PATH
-export VAGRANT_NUM_NODES=1
+export WORKSPACE="${WORKSPACE:-$PWD}"
+export GOPATH="${GOPATH:-$WORKSPACE/go}"
+export GOBIN="${GOBIN:-$GOPATH/bin}"
+export PATH="$GOPATH/bin:$PATH"
+export VAGRANT_NUM_NODES="${VAGRANT_NUM_NODES:-1}"
 
 # Install dockerize
 export DOCKERIZE_VERSION=v0.3.0
@@ -36,7 +37,7 @@ curl -LO https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSI
     && rm dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz
 
 # Keep .vagrant files between builds
-export VAGRANT_DOTFILE_PATH=$WORKSPACE/.vagrant
+export VAGRANT_DOTFILE_PATH="${VAGRANT_DOTFILE_PATH:-$WORKSPACE/.vagrant}"
 
 # Make sure that the VM is properly shut down on exit
 trap '{ vagrant halt; }' EXIT
@@ -70,6 +71,8 @@ cluster/kubectl.sh --init
 # Make sure we can connect to kubernetes
 export APISERVER=$(cat cluster/vagrant/.kubeconfig | grep server | sed -e 's# \+server: https://##' | sed -e 's/\r//')
 $WORKSPACE/dockerize -wait tcp://$APISERVER -timeout 120s
+# Make sure we don't try to talk to Vagrant host via a proxy
+export no_proxy="${APISERVER%:*}"
 
 # Wait for nodes to become ready
 while [ -n "$(kubectl get nodes --no-headers | grep -v Ready)" ]; do
@@ -93,28 +96,47 @@ echo ""
 echo ""
 
 # Delete traces from old deployments
-kubectl delete deployments --all
-kubectl delete pods --all
+namespaces=(default kube-system)
+for i in ${namespaces[@]}; do
+    kubectl -n ${i} delete deployment -l 'app'
+    kubectl -n ${i} delete services -l '!k8s-app,!provider'
+    kubectl -n ${i} delete pv --all
+    kubectl -n ${i} delete pvc --all
+    kubectl -n ${i} delete ds -l 'daemon'
+    kubectl -n ${i} delete crd --all
+    kubectl -n ${i} delete serviceaccounts -l 'name in (kubevirt, kubevirt-admin)'
+    kubectl -n ${i} delete clusterrolebinding -l 'name=kubevirt'
+    kubectl -n ${i} delete pods -l 'app'
+done
 
 # Deploy kubevirt
 cluster/sync.sh
 
 # Wait until kubevirt pods are running
-while [ -n "$(kubectl get pods --no-headers | grep -v Running)" ]; do
+while [ -n "$(kubectl get pods -n kube-system --no-headers | grep -v Running)" ]; do
     echo "Waiting for kubevirt pods to enter the Running state ..."
-    kubectl get pods --no-headers | >&2 grep -v Running
+    kubectl get pods -n kube-system --no-headers | >&2 grep -v Running || true
     sleep 10
 done
 
-# Make sure all containers are ready
-while [ -n "$(kubectl get pods -o'custom-columns=status:status.containerStatuses[*].ready' --no-headers | grep false)" ]; do
+# Make sure all containers except virt-controller are ready
+while [ -n "$(kubectl get pods -n kube-system -o'custom-columns=status:status.containerStatuses[*].ready,metadata:metadata.name' --no-headers | awk '!/virt-controller/ && /false/')" ]; do
     echo "Waiting for KubeVirt containers to become ready ..."
-    kubectl get pods -ocustom-columns='name:metadata.name,ready:status.containerStatuses[*].ready' | grep false
+    kubectl get pods -n kube-system -o'custom-columns=status:status.containerStatuses[*].ready,metadata:metadata.name' --no-headers | awk '!/virt-controller/ && /false/' || true
     sleep 10
 done
 
-kubectl get pods
+# Make sure that at least one virt-controller container is ready
+while [ "$(kubectl get pods -n kube-system -o'custom-columns=status:status.containerStatuses[*].ready,metadata:metadata.name' --no-headers | awk '/virt-controller/ && /true/' | wc -l)" -lt "1" ]; do
+    echo "Waiting for KubeVirt virt-controller container to become ready ..."
+    kubectl get pods -n kube-system -o'custom-columns=status:status.containerStatuses[*].ready,metadata:metadata.name' --no-headers | awk '/virt-controller/ && /true/' | wc -l
+    sleep 10
+done
+
+kubectl get pods -n kube-system
 kubectl version
 
+# Disable proxy configuration since it causes test issues
+export -n http_proxy
 # Run functional tests
 FUNC_TEST_ARGS="--ginkgo.noColor" make functest

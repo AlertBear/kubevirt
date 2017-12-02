@@ -24,6 +24,9 @@ bash ./setup_kubernetes_common.sh
 yum install -y cockpit cockpit-kubernetes
 systemctl enable cockpit.socket && systemctl start cockpit.socket
 
+# W/A for https://github.com/kubernetes/kubernetes/issues/53356
+rm -rf /var/lib/kubelet
+
 # Create the master
 kubeadm init --pod-network-cidr=10.244.0.0/16 --token abcdef.1234567890123456
 
@@ -41,8 +44,9 @@ done
 
 set -e
 
-if [ "$NETWORK_PROVIDER" == "weave" ]; then 
-  kubectl apply -f https://github.com/weaveworks/weave/releases/download/v1.9.4/weave-daemonset-k8s-1.6.yaml
+if [ "$NETWORK_PROVIDER" == "weave" ]; then
+  kubever=$(kubectl version | base64 | tr -d '\n')
+  kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$kubever"
 else
   kubectl create -f kube-$NETWORK_PROVIDER.yaml
 fi
